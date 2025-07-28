@@ -1,8 +1,11 @@
+import sys
+REPO_PATH = "C:/Users/antonio/Desktop/perception_models/" 
+sys.path.append(REPO_PATH)
 import torch 
 import torch.nn as nn
 import sys 
 from torch.optim import Optimizer
-
+import core.vision_encoder.pe as pe
 class Probe(nn.Module):
     """
     A probe to attach to a backbone model.

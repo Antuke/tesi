@@ -26,7 +26,7 @@ from probe import Probe
 
 ####---------- CONFIGS ----------####
 
-QUICK = True
+QUICK = False
 AGE_FOLDER = './age_outputs'
 GENDER_FOLDER = './gender_outputs'
 EMOTION_FOLDER = './emotions_outputs'
