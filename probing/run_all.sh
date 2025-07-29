@@ -1,9 +1,9 @@
 
 # Common settings
-DATASET_ROOT="C:\Users\antonio\Desktop\dataset tesi"
-DEFAULT_CSV_PATH="C:\Users\antonio\Desktop\dataset tesi\merged_labels.csv"
-AGE_CSV_PATH="C:\Users\antonio\Desktop\dataset tesi\age_labels_classification.csv"
-EMOTION_CSV_PATH="C:\Users\antonio\Desktop\dataset tesi\emotions_labels.csv"
+DATASET_ROOT="/user/asessa/dataset tesi"
+GENDER_CSV_PATH="/user/asessa/dataset tesi/merged_labels.csv"
+AGE_CSV_PATH="/user/asessa/dataset tesi/age_labels_classification.csv"
+EMOTION_CSV_PATH="/user/asessa/dataset tesi/emotions_labels.csv"
 CKPT_PATH="C:\Users\antonio\Desktop\perception_models\ckpt\PE-Core-B16-224.pt"
 
 
@@ -14,7 +14,6 @@ CKPT_PATH="C:\Users\antonio\Desktop\perception_models\ckpt\PE-Core-B16-224.pt"
 python probing.py \
     --task age_classification \
     --version 'PE-Core-B16-224' \
-    --ckpt_path $CKPT_PATH \
     --dataset_root "$DATASET_ROOT" \
     --csv_path "$AGE_CSV_PATH" \
     --probe_type "attention" \
@@ -53,14 +52,14 @@ python probing.py \
     --version 'PE-Core-B16-224' \
     --ckpt_path $CKPT_PATH \
     --dataset_root "$DATASET_ROOT" \
-    --csv_path "$DEFAULT_CSV_PATH" \
+    --csv_path "$GENDER_CSV_PATH" \
     --probe_type "attention"
 
 python probing.py \
     --task gender \
     --version 'google/Siglip2-base-patch16-224' \
     --dataset_root "$DATASET_ROOT" \
-    --csv_path "$DEFAULT_CSV_PATH" \
+    --csv_path "$GENDER_CSV_PATH" \
     --probe_type "attention"
 
 

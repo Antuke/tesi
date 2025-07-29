@@ -1,6 +1,10 @@
+import argparse
 import sys
-REPO_PATH = "C:/Users/antonio/Desktop/perception_models/" 
-sys.path.append(REPO_PATH)
+import os
+from dotenv import load_dotenv
+load_dotenv()
+sys.path.append(os.getenv("REPO_PATH"))
+
 import torch 
 import torch.nn as nn
 import sys 

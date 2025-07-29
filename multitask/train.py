@@ -1,10 +1,11 @@
-import random
+import argparse
 import sys
+import os
+from dotenv import load_dotenv
+load_dotenv()
+sys.path.append(os.getenv("REPO_PATH"))
 
-REPO_PATH = "C:/Users/antonio/Desktop/perception_models/"
-sys.path.append(REPO_PATH)
-
-
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim

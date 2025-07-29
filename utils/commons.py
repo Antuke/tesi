@@ -47,7 +47,7 @@ def plot_confusion_matrix(cm, class_names, ylabel="True Age Group", xlabel="Pred
     plt.xlabel(xlabel, fontsize=12)
     plt.show()
 
-def get_backbone_pe(ckpt, version):
+def _get_backbone_pe(ckpt, version):
     backbone_config = PE_VISION_CONFIG[version]
     transform = transforms_pe.get_image_transform_fix(image_size=backbone_config.image_size)
     v_cfg = asdict(backbone_config)
@@ -55,6 +55,11 @@ def get_backbone_pe(ckpt, version):
     backbone.load_ckpt(ckpt)
     return backbone, transform, backbone_config.output_dim
 
+def get_backbone_pe(version):
+    backbone = pe.VisionTransformer.from_config(version, pretrained=True)
+    backbone_config = PE_VISION_CONFIG[version]
+    transform = transforms_pe.get_image_transform_fix(image_size=backbone_config.image_size)
+    return backbone, transform, backbone_config.output_dim
 
 def get_backbone_siglip2(model_name: str='google/siglip2-base-patch16-224'):
     print(f"Loading Hugging Face model: {model_name}")
@@ -87,7 +92,10 @@ def _convert_to_rgb(image: Image.Image) -> Image.Image:
 
 def get_backbone(version: str, ckpt : str=None):
     if 'PE-Core-' in version:
-        return get_backbone_pe(ckpt, version)
+        if ckpt is not None:
+            return _get_backbone_pe(ckpt, version)
+        else:
+            return get_backbone_pe(version)
     else:
         return get_backbone_siglip2(version)
 

@@ -2,13 +2,13 @@
 import argparse
 import sys
 import os
-
-from sklearn.metrics import confusion_matrix
+from dotenv import load_dotenv
+load_dotenv()
+sys.path.append(os.getenv("REPO_PATH"))
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay 
+import seaborn as sns
 from tqdm import tqdm
-REPO_PATH = "C:/Users/antonio/Desktop/perception_models/"
-sys.path.append(REPO_PATH)
-
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -21,7 +21,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim import Optimizer
 from utils.dataset import *
 from utils.commons import *
-from torch.optim.lr_scheduler import _LRScheduler, CosineAnnealingLR
+from torch.optim.lr_scheduler import _LRScheduler, CosineAnnealingLR, ReduceLROnPlateau
 from probe import Probe
 
 ####---------- CONFIGS ----------####
@@ -111,7 +111,7 @@ def train_epoch(loader : DataLoader, probe: Probe, criterion, optimizer: Optimiz
         running_loss += loss.item()
         loader.set_postfix(loss=loss.item())
         
-    scheduler.step()
+    # scheduler.step()
     return running_loss / len(loader)
 
 def validate(loader: DataLoader, probe: Probe, criterion, task: str):
@@ -160,7 +160,7 @@ def validate(loader: DataLoader, probe: Probe, criterion, task: str):
 
 
     cm = confusion_matrix(all_true_labels, all_pred_labels, labels=class_labels)
-    return running_loss / len(loader), cm
+    return running_loss / len(loader), cm, class_labels
 
 
 
@@ -177,22 +177,6 @@ def probe_task(
     batch_size: int = 32,
     learning_rate: float = 0.001
     ):
-    """
-    Probing function for all tasks.
-
-    Args:
-        task: One of 'age_regression', 'age_classification', 'gender', 'emotion'
-        version: Backbone model version
-        epochs: Number of training epochs
-        dataset_root_dir: Root directory of dataset images
-        csv_path: Path to CSV file with labels
-        attention_probing: Whether to use attention probing or linear probing
-        ckpt_path: Path to backbone checkpoint
-        resume_from_ckpt: Path to a checkpoint to resume training from.
-        batch_size: Batch size for training
-        learning_rate: Learning rate for optimizer
-    """
-
 
 
     config = TASK_CONFIG[task]
@@ -232,8 +216,8 @@ def probe_task(
         filter(lambda p: p.requires_grad, probe.parameters()),
         lr=learning_rate
     )
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
-
+    # scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
+    scheduler = ReduceLROnPlateau(optimizer)
     start_epoch = 0
     if resume_from_ckpt:
         if os.path.exists(resume_from_ckpt):
@@ -252,7 +236,7 @@ def probe_task(
             optimizer=optimizer,
             scheduler=scheduler
         )
-        val_loss, _ = validate(
+        val_loss, _, _ = validate(
             loader=val_loader,
             probe=probe,
             criterion=criterion,
@@ -273,7 +257,7 @@ def probe_task(
 
     # Final test
     print(f"\n--- Final Testing on {task} ---")
-    test_loss, cm = validate(
+    test_loss, cm, class_labels = validate(
         loader=test_loader,
         probe=probe,
         criterion=criterion,
@@ -282,7 +266,14 @@ def probe_task(
     print(f"Final Test Loss: {test_loss:.5f}")
     print("Confusion Matrix:\n", cm)
 
+
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_labels) 
+    disp.plot() 
+    plt.savefig(f'{config['output_folder']}/cm.jpg', bbox_inches='tight') 
+
     return test_loss, cm
+
+
 
 def main():
     parser = argparse.ArgumentParser(description="Train and validate attention probes for different tasks.")
@@ -293,15 +284,14 @@ def main():
                        default='google/Siglip2-base-patch16-224',
                        help='Backbone model version.')
     parser.add_argument('--ckpt_path', type=str,
-                       default='../ckpt/PE-Core-B16-224.pt',
-                       help='Path to the backbone checkpoint.')
+                       help='Path to the backbone checkpoint. Only for PE')
     parser.add_argument('--resume_from_ckpt', type=str, default=None,
                         help='Path to a checkpoint to resume training from.')
-    parser.add_argument('--epochs', type=int, default=2,
+    parser.add_argument('--epochs', type=int, default=3,
                        help='Number of training epochs.')
     parser.add_argument('--dataset_root', type=str,
                        help='Root directory of the dataset images.',
-                       default=r'C:\Users\antonio\Desktop\dataset tesi')
+                       default=os.getenv("DATASET_ROOT"))
     parser.add_argument('--csv_path', type=str,
                        help='Path to the CSV file with labels.',
                        default=r'C:\Users\antonio\Desktop\dataset tesi\merged_labels.csv')

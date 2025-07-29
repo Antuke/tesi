@@ -74,10 +74,11 @@ class AgeDataset(Dataset):
             idx = idx.tolist()
 
         relative_img_path = self.labels_df.iloc[idx, 0]
+        relative_img_path = relative_img_path.replace('\\', '/')
+        
         format = '.jpg'
 
         full_img_path = os.path.join(self.root_dir, relative_img_path + format)
-        
 
         image = Image.open(full_img_path)
         if self.classification:
@@ -247,9 +248,9 @@ def get_loaders_broken_(full_dataset, generator, batch_size=32):
     )
 
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True)
+    train_loader    = DataLoader(train_dataset,  batch_size=batch_size,shuffle=True,num_workers=8)
+    val_loader      = DataLoader(val_dataset,  batch_size=batch_size,shuffle=True,num_workers=8)
+    test_loader     = DataLoader(test_dataset,  batch_size=batch_size,shuffle=True,num_workers=8)
 
     return train_loader, val_loader, test_loader
     
