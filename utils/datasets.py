@@ -37,6 +37,8 @@ from torchvision import transforms
 from torch.utils.data import random_split
 from torch.utils.data import Subset
 from torch.utils.data import WeightedRandomSampler
+from sklearn.model_selection import train_test_split
+
 
 PATH_COLUMN = 0
 GENDER_COLUMN = 1
@@ -46,32 +48,52 @@ age_id2label = ['0-2','3-9','10-19','20-29','30-39','40-49','50-59','60-69','70+
 gender_id2label = ['Male','Female']
 emotion_id2label = ["Surprise", "Fear", "Disgust", "Happy", "Sad", "Angry", "Neutral"]
 
+def get_split(path_df, stratify_column='Age', test_split=0.2):
+    full_df = pd.read_csv(path_df)
+
+    train_df, val_df = train_test_split(
+        full_df, 
+        test_size=test_split, 
+        random_state=42, 
+        stratify=full_df[stratify_column]
+    )
+    print(f'[DATASET] Train df = {len(train_df)}; Validation df = {len(val_df)}')
+    return train_df, val_df
+
+
 class BaseDataset(Dataset, ABC):
     """Abstract base class for image datasets with CSV labels."""
     
     def __init__(self, 
-                 csv_path,
+                 df,
                  transform,
                  root_dir='/user/asessa/dataset tesi/', 
-                 target_per_label=None,
-                 stratify_on = 'Age'):
+                 stratify_on = 'Age',
+                 return_path=False):
         
-        self.labels_df = pd.read_csv(csv_path)
+        self.data_pool_df = df.reset_index(drop=True)
         self.root_dir = root_dir
         self.transform = transform
-        
-        # Keep a fraction of the dataset to test quickly
-        if target_per_label is not None:
-            print(f"Original value counts:\n{self.labels_df[stratify_on].value_counts().sort_index()}\n")
-            
-            self.labels_df = self.dynamic_stratified_sample(
-                df=self.labels_df,
-                strata_col=stratify_on,
-                target_samples=target_per_label
-            )
-            
-            print(f"Value counts after dynamic sampling (target={target_per_label}):\n{self.labels_df[stratify_on].value_counts().sort_index()}")
+        self.active_df = self.data_pool_df.copy()
+        self.stratify_on = stratify_on
+        self.return_path = return_path
     
+    """
+    def resample(self, target_samples_per_class):
+        print(f"\n[Dataset] Re-sampling data with target of {target_samples_per_class} per class...")
+        
+        def sample_group(group):
+            if len(group) > target_samples_per_class:
+                return group.sample(n=target_samples_per_class, random_state=np.random.randint(0,1000))
+            else:
+                return group
+
+        self.labels_df = self.full_labels_df.groupby(
+            self.stratify_on, group_keys=False
+        ).apply(sample_group)
+        
+        print(f"[Dataset] New dataset size: {len(self.labels_df)}")
+    """
 
     def dynamic_stratified_sample(self, df, strata_col, target_samples):
         """
@@ -88,23 +110,54 @@ class BaseDataset(Dataset, ABC):
 
         return df.groupby(strata_col, group_keys=False).apply(sample_group)
 
+    def resample(self, target_samples_per_class: int):
+        """
+        replaces the active DataFrame by resampling from the whole datapool
+        """
+        if target_samples_per_class is None:
+            self.active_df = self.data_pool_df.copy()
+            return
+            
+        grouped = self.data_pool_df.groupby(self.stratify_on)
+        resampled_indices = []
+
+        for name, group in grouped:
+            if len(group) > target_samples_per_class:
+                # Sample indices, which is faster than sampling rows
+                resampled_indices.extend(group.sample(n=target_samples_per_class, random_state=np.random.randint(0,10000)).index)
+            else:
+                resampled_indices.extend(group.index)
+
+        # Use .loc for fast slicing based on the collected indices
+        self.active_df = self.data_pool_df.loc[resampled_indices].reset_index(drop=True)
+        
+        print(f"[Resampled] New counts:\n{self.active_df[self.stratify_on].value_counts().sort_index()}")
+
     def __len__(self):
-        return len(self.labels_df)
+        return len(self.active_df)
     
     def __getitem__(self, idx):
-        if torch.is_tensor(idx):
-            idx = idx.tolist()
-        
-        # Load image
-        relative_img_path = self.labels_df.iloc[idx, PATH_COLUMN]
-        img_path = self.root_dir + relative_img_path
-        image = Image.open(img_path)
-        
-        # Get labels using abstract method
-        labels = self.get_labels(idx)
-        
-        return self.transform(image), labels
-    
+        try:
+            if torch.is_tensor(idx):
+                idx = idx.tolist()
+            
+            # Load image
+            relative_img_path = self.active_df.iloc[idx, PATH_COLUMN]
+            img_path = self.root_dir + relative_img_path
+            image = Image.open(img_path)
+            
+            # Get labels using abstract method
+            labels = self.get_labels(idx)
+            if self.return_path:
+                return self.transform(image), labels, img_path
+
+            return self.transform(image), labels
+        except Exception as e:
+            print(f"ERROR: Caught an exception in __getitem__ for index {idx}, path:")
+            print(f"Exception: {e}")
+            # Return a dummy sample of the correct size/type or raise the error
+            # Returning a dummy can help identify multiple bad files at once.
+            return torch.zeros_like(self.__getitem__(0)[0]), -1 # Example dummy
     @abstractmethod
     def get_labels(self, idx):
         """Abstract method to extract labels from the dataframe."""
@@ -119,7 +172,7 @@ class AgeDataset(BaseDataset):
     """Dataset for age prediction tasks."""
     
     def get_labels(self, idx):
-        return torch.tensor(self.labels_df.iloc[idx, AGE_COLUMN], 
+        return torch.tensor(self.active_df.iloc[idx, AGE_COLUMN], 
                           dtype=torch.long)
 
     def get_inverse_weight(self):
@@ -133,13 +186,13 @@ class GenderDataset(BaseDataset):
     """Dataset for gender classification tasks."""
     
     def get_labels(self, idx):
-        return torch.tensor(self.labels_df.iloc[idx, GENDER_COLUMN], 
+        return torch.tensor(self.active_df.iloc[idx, GENDER_COLUMN], 
                           dtype=torch.long)
 
     def get_inverse_weight(self):
         """method to obtain weight for Weighted Cross Entropy."""
-        class_counts = self.labels_df.iloc[:, GENDER_COLUMN].value_counts().sort_index()
-        total_samples = len(self.labels_df)
+        class_counts = self.active_df.iloc[:, GENDER_COLUMN].value_counts().sort_index()
+        total_samples = len(self.labeactive_dfls_df)
         weights = total_samples / (len(gender_id2label) * class_counts)
         return torch.tensor(weights.values, dtype=torch.float)
 
@@ -147,13 +200,13 @@ class EmotionDataset(BaseDataset):
     """Dataset for emotion classification tasks."""
     
     def get_labels(self, idx):
-        return torch.tensor(self.labels_df.iloc[idx, EMOTION_COLUMN], 
+        return torch.tensor(self.active_df.iloc[idx, EMOTION_COLUMN], 
                           dtype=torch.long)
     
     def get_inverse_weight(self):
         """method to obtain weight for Weighted Cross Entropy."""
-        class_counts = self.labels_df.iloc[:, EMOTION_COLUMN].value_counts().sort_index()
-        total_samples = len(self.labels_df)
+        class_counts = self.active_df.iloc[:, EMOTION_COLUMN].value_counts().sort_index()
+        total_samples = len(self.active_df)
         weights = total_samples / (len(emotion_id2label) * class_counts)
         return torch.tensor(weights.values, dtype=torch.float)
 
@@ -175,7 +228,8 @@ class CombinedDataset(Dataset):
                  emotion_csv_path,
                  transform,
                  root_dir='/user/asessa/dataset tesi/',
-                 keep=0.2):
+                 keep=0.2,
+                 return_path=False):
 
         # age_df = pd.read_csv(age_csv_path)
         # the gender csv contains every sample of the age csv
@@ -268,7 +322,29 @@ class CombinedDataset(Dataset):
         return weights
 
 
+def resample(dataset_train, dataset_val, batch_size, target_samples_per_class_train, target_samples_per_class_val, num_workers):
+    """To call at the start of each new epoch, resamples the whole dataset and returns new dataloaders"""
+    dataset_train.resample(target_samples_per_class=target_samples_per_class_train)
 
+    train_loader = DataLoader(
+        dataset_train,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True
+    )
+
+    dataset_val.resample(target_samples_per_class=target_samples_per_class_val)
+
+    val_loader = DataLoader(
+        dataset_val,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True
+    )
+
+    return train_loader, val_loader
 
 def get_loaders(full_dataset, generator, batch_size, split = [0.8,0.2]):
     """Return train and validation loader given a dataset (do not use for Combined)"""
@@ -283,9 +359,9 @@ def get_loaders(full_dataset, generator, batch_size, split = [0.8,0.2]):
     )
     print('puzzo')
     train_loader = DataLoader(train_dataset,  batch_size=batch_size,shuffle=True,
-                                 num_workers=4, pin_memory=False)
+                                 num_workers=16, pin_memory=True)
     val_loader = DataLoader(val_dataset,  batch_size=batch_size,shuffle=True,
-                                 num_workers=4, pin_memory=False)
+                                 num_workers=16, pin_memory=True)
 
 
     return train_loader, val_loader

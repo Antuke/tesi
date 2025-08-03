@@ -4,7 +4,6 @@ from transformers import AutoModel, AutoProcessor
 REPO_PATH = "C:/Users/antonio/Desktop/perception_models/"
 sys.path.append(REPO_PATH)
 
-from utils.dataset import AgeDataset
 import os
 import torch
 import torch.nn as nn
@@ -14,7 +13,6 @@ from torch.utils.data import Dataset, DataLoader
 import core.vision_encoder.pe as pe
 import core.vision_encoder.transforms as transforms_pe
 from core.vision_encoder.config import PE_VISION_CONFIG, PEConfig, fetch_pe_checkpoint
-from utils.dataset import AgeDataset
 from dataclasses import asdict
 import torchvision.transforms as transforms
 from tqdm import tqdm
@@ -27,26 +25,6 @@ from torch.optim.lr_scheduler import _LRScheduler
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-def plot_confusion_matrix(cm, class_names, ylabel="True Age Group", xlabel="Predicted Age Group"):
-    """
-    Generates and displays a heatmap for a given confusion matrix.
-    
-    Args:
-       cm (array): A confusion matrix.
-       class_names (list): A list of category names for the axes.
-    """
-    plt.figure(figsize=(12, 10))
-    heatmap = sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", 
-                          xticklabels=class_names, yticklabels=class_names)
-    
-    heatmap.set_yticklabels(heatmap.get_yticklabels(), rotation=0) 
-    heatmap.set_xticklabels(heatmap.get_xticklabels(), rotation=45, ha='right')
-    
-    plt.title("Confusion Matrix", fontsize=16)
-    plt.ylabel(ylabel, fontsize=12)
-    plt.xlabel(xlabel, fontsize=12)
-    plt.show()
-
 def _get_backbone_pe(ckpt, version):
     backbone_config = PE_VISION_CONFIG[version]
     transform = transforms_pe.get_image_transform_fix(image_size=backbone_config.image_size)
@@ -56,16 +34,22 @@ def _get_backbone_pe(ckpt, version):
     return backbone, transform, backbone_config.output_dim
 
 def get_backbone_pe(version):
+    """
+    Load PE ViT model, return model, transforms and size of output (dimension of embedding of last token)
+    """
     backbone = pe.VisionTransformer.from_config(version, pretrained=True)
     backbone_config = PE_VISION_CONFIG[version]
     transform = transforms_pe.get_image_transform_fix(image_size=backbone_config.image_size)
     return backbone, transform, backbone_config.output_dim
 
 def get_backbone_siglip2(model_name: str='google/siglip2-base-patch16-224'):
+    """
+    Load siglip2 ViT model, return model, transforms and size of output (dimension of embedding of last token)
+    """
     print(f"Loading Hugging Face model: {model_name}")
-    
     processor = AutoProcessor.from_pretrained(model_name)
-    
+
+
     # Extract image processing configuration from the loaded processor
     image_processor_config = processor.image_processor
     image_size = image_processor_config.size['height']
@@ -82,7 +66,7 @@ def get_backbone_siglip2(model_name: str='google/siglip2-base-patch16-224'):
     # Load the model and return only the vision backbone
     model = AutoModel.from_pretrained(model_name)
     vision_model = model.vision_model
-    
+    print(f'Vision model = {vision_model}')
     return vision_model, transform, vision_model.config.hidden_size
 
 def _convert_to_rgb(image: Image.Image) -> Image.Image:
@@ -91,6 +75,12 @@ def _convert_to_rgb(image: Image.Image) -> Image.Image:
 
 
 def get_backbone(version: str, ckpt : str=None):
+    """
+    Returns vision transformer backbone
+    Args:
+        version: Name of the backbone to use, PE-Core or Siglip
+        ckpt: if different from null, loads backbone from .pt file specified, only for PE
+    """
     if 'PE-Core-' in version:
         if ckpt is not None:
             return _get_backbone_pe(ckpt, version)
@@ -102,12 +92,17 @@ def get_backbone(version: str, ckpt : str=None):
 def log_to_disk(log_dir, message, mode):
     """
     Logs a message to a file on disk.
+
+    Args:
+        log_dir: Directory where the training_log.txt file is
+        message: Message to save on the file
+        mode: prefix of training_log.txt
     """
     # Ensure the target directory exists.
     os.makedirs(log_dir, exist_ok=True)
 
     log_path = os.path.join(log_dir, f'{mode}_training_log.txt')
-    header = 'epoch,train_loss,val_loss'
+    header = 'epoch,train_loss,val_loss,lr'
 
     # Check if the file needs a header. This is true if the file does not exist.
     write_header = not os.path.exists(log_path)
@@ -130,7 +125,6 @@ def save_checkpoint(epoch: int, model: nn.Module, optimizer: Optimizer, schedule
         scheduler (_LRScheduler): The learning rate scheduler to save.
         path (str): The path to save the checkpoint file to.
     """
-    # Ensure the directory exists
     os.makedirs(os.path.dirname(path), exist_ok=True)
     
     checkpoint = {
