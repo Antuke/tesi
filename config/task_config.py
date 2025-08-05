@@ -18,7 +18,7 @@ if REPO_PATH:
     sys.path.append(REPO_PATH)
 
 # Assuming these are your custom modules
-from utils.datasets import AgeDataset, EmotionDataset, GenderDataset, BaseDataset
+from utils.datasets import AgeDataset, EmotionDataset, GenderDataset, BaseDataset, CombinedDataset
 
 
 class AgeOrdinalLoss():
@@ -96,8 +96,8 @@ TASK_REGISTRY = {
         stratify_column='Gender',
         get_predictions=get_classification_preds,
         true_label_map=lambda labels_flat, class_labels: [class_labels[int(l)] for l in labels_flat],
-        target_samples_per_class_train=1800,
-        target_samples_per_class_val=180,
+        target_samples_per_class_train=8192,
+        target_samples_per_class_val=1280,
         use_inverse_weights=False
     ),
     'emotion': TaskConfig(
@@ -115,3 +115,39 @@ TASK_REGISTRY = {
         use_inverse_weights=True
     ),
 }
+
+@dataclass
+class MTLConfig:
+    task_names: List[str]
+    age_labels: List[str]
+    gender_labels: List[str]
+    emotion_labels: List[str]
+    test_set_gender_age: Path
+    test_set_emotions: Path
+    dataset_class: Type[CombinedDataset]
+    criterions: List[Type[nn.Module]]
+    output_folder: Path
+    header: str
+    class_labels_list: List[List[str]]
+    task_to_labels: Dict[str, List[str]] = field(init=False)
+
+    def __post_init__(self):
+        self.task_to_labels = {
+            "Age": self.age_labels,
+            "Gender": self.gender_labels,
+            "Emotion": self.emotion_labels
+        }
+
+MTL_TASK_CONFIG = MTLConfig(
+    class_labels_list=[["0-2","3-9", "10-19", "20-29", "30-39", "40-49", "50-59", "60-69", "70+"],["Male", "Female"] ,["Surprise", "Fear", "Disgust", "Happy", "Sad", "Angry", "Neutral"]],
+    task_names=['Age','Gender','Emotion'],
+    age_labels= ["0-2","3-9", "10-19", "20-29", "30-39", "40-49", "50-59", "60-69", "70+"],
+    emotion_labels=["Surprise", "Fear", "Disgust", "Happy", "Sad", "Angry", "Neutral"],
+    gender_labels=["Male", "Female"],
+    test_set_gender_age=Path('/user/asessa/dataset tesi/datasets_with_standard_labels/UTKFace/test/labels_test_utk.csv'),
+    test_set_emotions=Path('/user/asessa/dataset tesi/datasets_with_standard_labels/RAF-DB/test/labels_test_raf.csv'),
+    dataset_class=CombinedDataset,
+    criterions=[nn.CrossEntropyLoss, nn.CrossEntropyLoss, nn.CrossEntropyLoss],
+    output_folder=Path('./outputs'),
+    header="epoch,train_avg_loss,train_age_loss,train_gender_loss,train_emotion_loss,val_avg_loss,val_age_loss,val_gender_loss,val_emotion_loss,accuracy_val_avg,accuracy_age,accuracy_gender,accuracy_emotion,lr"
+) 

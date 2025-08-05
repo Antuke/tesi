@@ -66,7 +66,6 @@ def get_backbone_siglip2(model_name: str='google/siglip2-base-patch16-224'):
     # Load the model and return only the vision backbone
     model = AutoModel.from_pretrained(model_name)
     vision_model = model.vision_model
-    print(f'Vision model = {vision_model}')
     return vision_model, transform, vision_model.config.hidden_size
 
 def _convert_to_rgb(image: Image.Image) -> Image.Image:
@@ -89,7 +88,7 @@ def get_backbone(version: str, ckpt : str=None):
     else:
         return get_backbone_siglip2(version)
 
-def log_to_disk(log_dir, message, mode):
+def log_to_disk(log_dir, message, mode, header = 'epoch,train_loss,val_loss,lr'):
     """
     Logs a message to a file on disk.
 
@@ -102,7 +101,6 @@ def log_to_disk(log_dir, message, mode):
     os.makedirs(log_dir, exist_ok=True)
 
     log_path = os.path.join(log_dir, f'{mode}_training_log.txt')
-    header = 'epoch,train_loss,val_loss,lr'
 
     # Check if the file needs a header. This is true if the file does not exist.
     write_header = not os.path.exists(log_path)
@@ -136,3 +134,25 @@ def save_checkpoint(epoch: int, model: nn.Module, optimizer: Optimizer, schedule
     path_with_ext = path + '_checkpoint.pt'
     torch.save(checkpoint, path_with_ext)
     print(f"Checkpoint saved to {path_with_ext}")
+
+
+
+
+def convert_labels(labels):
+    """Converts so to compare with different age-group"""
+    new_labels = []
+    for label in labels:
+        if label in ["0-2", "3-9"]:
+            new_labels.append("0-9")
+        elif label in ["10-19"]:
+            new_labels.append("10-19")
+        elif label in ["20-29", "30-39"]:
+            new_labels.append("20-39")
+        elif label in ["40-49", "50-59"]:
+            new_labels.append("40-59")
+        elif label in ["60-69", "70+"]:
+            new_labels.append("60+")
+        else:
+            # Handle any unexpected labels
+            new_labels.append(label)
+    return new_labels

@@ -26,30 +26,13 @@ if REPO_PATH:
     sys.path.append(REPO_PATH)
 
 from probing.probe import Probe
-from utils.commons import log_to_disk, get_backbone
+from utils.commons import log_to_disk, get_backbone, convert_labels
 from utils.datasets import get_split, resample
 from config.task_config import TaskConfig
 
 NUM_WORKERS = 8
 
-def convert_labels(labels):
-    """Converts so to compare with different age-group"""
-    new_labels = []
-    for label in labels:
-        if label in ["0-2", "3-9"]:
-            new_labels.append("0-9")
-        elif label in ["10-19"]:
-            new_labels.append("10-19")
-        elif label in ["20-29", "30-39"]:
-            new_labels.append("20-39")
-        elif label in ["40-49", "50-59"]:
-            new_labels.append("40-59")
-        elif label in ["60-69", "70+"]:
-            new_labels.append("60+")
-        else:
-            # Handle any unexpected labels
-            new_labels.append(label)
-    return new_labels
+
 
 class Trainer:
     """Encapsulates the training, validation, and testing logic for a probe."""
@@ -113,12 +96,13 @@ class Trainer:
         task_name = self.args.task.split('_')[0]
         suffix = "head" if is_head_only else str(epoch)
         filename = f"{self.probing_type}_{task_name}_{self.version_name}_{suffix}.pt"
-        return self.config.output_folder / filename
+        return self.config.output_folder / 'ckpt' / filename
 
     def train(self):
         """Runs the main training loop."""
         print(f"\n--- Starting {self.args.task} Probing ({self.probing_type}) ---")
         self.config.output_folder.mkdir(exist_ok=True)
+        (self.config.output_folder / 'ckpt').mkdir(exist_ok=True)
         minimum_val_loss = float('inf')
 
         if self.args.task == 'emotion':
@@ -140,7 +124,7 @@ class Trainer:
             self.save_cm(cm, class_labels)
 
             lr = self.scheduler.get_last_lr()[0]
-            log_to_disk(self.config.output_folder, f'{i+1},{train_loss:.5f},{val_loss:.5f},{lr}', f'{self.probing_type}_{self.version_name}')
+            log_to_disk(self.config.output_folder, f'{i+1},{train_loss:.5f},{val_loss:.5f},{lr:.6f}', f'{self.probing_type}_{self.version_name}')
             print(f'\nFinished Epoch {i+1}\nTraining Loss = {train_loss:.5f}\nValidation Loss = {val_loss:.5f}\nValidation Accuracy = {accuracy:.5f}')
 
             # Checkpoint saving logic
@@ -252,29 +236,41 @@ class Trainer:
         )
         test_loader = DataLoader(test_set, batch_size=self.args.batch_size, shuffle=False, num_workers=NUM_WORKERS, pin_memory=False)
 
-        test_loss, cm, class_labels, accuracy = self._evaluate(test_loader, description="Final Testing", convert=False, save_misclass=0)
+        test_loss, cm, class_labels, accuracy = self._evaluate(test_loader, description="Final Testing", convert=False, save_misclass=-1)
         
         print(f"Final Test Loss: {test_loss:.5f}\nFinal accuracy: {accuracy:.3f}%")
         print("Confusion Matrix:\n", cm)
 
         # Plot and save confusion matrix
-        self.save_cm(cm, class_labels)
+        self.save_cm(cm, class_labels, final=True)
         
         log_to_disk(self.config.output_folder, f'test_loss,{test_loss:.5f},{accuracy:.5f}', f'{self.probing_type}_{self.version_name}')
 
-    def save_cm(self, cm, class_labels):
+    def save_cm(self, cm, class_labels, final=False):
         disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_labels)
         disp.plot()
         cm_path = self.config.output_folder / f'cm_{self.probing_type}_{self.version_name}.jpg'
+        if final:
+            cm_path = self.config.output_folder / f'cm_{self.probing_type}_{self.version_name}_test_set.jpg'
         plt.savefig(cm_path, bbox_inches='tight')
         print(f"Confusion matrix saved to {cm_path}")
 
 
     def cleanup(self):
-        """
-        Perform cleanup operations.
-        This method is called to ensure resources are released.
-        """
-        print("Shutting down Trainer and associated workers.")
-        self.train_loader = None
-        self.test_loader = None
+        print("\n[Trainer Cleanup] Searching for active worker processes...")
+        import multiprocessing
+        active_procs = multiprocessing.active_children()
+        
+        if not active_procs:
+            print("[Trainer Cleanup] No active child processes found.")
+            return
+
+        for process in active_procs:
+            print(f"[Trainer Cleanup] Shutting down process: {process.name} (PID: {process.pid})")
+            process.terminate()  # Sends a SIGTERM signal to the process
+            process.join(timeout=5) # Waits for the process to terminate gracefully
+            if process.is_alive():
+                print(f"[Trainer Cleanup] Process {process.pid} did not terminate, forcing kill.")
+                process.kill() # If it doesn't terminate, force kill it with SIGKILL
+        
+        print("[Trainer Cleanup] All worker processes have been handled.")

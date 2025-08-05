@@ -11,7 +11,7 @@ import core.vision_encoder.pe as pe
 
 
 DROPOUT_P = 0.1
-GENDERS_NUM = 1
+GENDERS_NUM = 2
 EMOTIONS_NUM = 7
 AGE_GROUPS_NUM = 9
 
@@ -61,18 +61,30 @@ class MultiTaskProbe(nn.Module):
         if hasattr(self.backbone, 'attn_pool'):
             for param in self.backbone.attn_pool.parameters():
                 param.requires_grad = True
-        # TODO unfreeze logic for pe
-        
+            if num_layers_to_unfreeze > 0:
+                self.backbone.proj.requires_grad = True
+            
+                for param in self.backbone.ln_post.parameters():
+                    param.requires_grad = True
+
+                layers = self.backbone.transformer.resblocks
+                num_to_unfreeze = min(len(layers), num_layers_to_unfreeze)
+                for block in layers[-num_to_unfreeze:]:
+                    for param in block.parameters():
+                        param.requires_grad = True
+
         # SigLip2
         if hasattr(self.backbone, 'head'):
             for param in self.backbone.head.parameters():
                 param.requires_grad = True
 
             if num_layers_to_unfreeze > 0:
+                for p in self.backbone.post_layernorm.parameters():
+                    p.requires_grad = True 
+                
                 layers = self.backbone.encoder.layers
                 num_to_unfreeze = min(len(layers), num_layers_to_unfreeze)
-                layers_to_unfreeze = layers[-num_to_unfreeze:] # get the last layers to unfreeze
-                for l in layers_to_unfreeze:
+                for l in layers[-num_to_unfreeze:]:
                     for param in l.parameters():
                             param.requires_grad = True
 
@@ -91,7 +103,7 @@ class MultiTaskProbe(nn.Module):
         age_logits = self.age_head(shared_features)
         emotion_logits = self.emotion_head(shared_features)
             
-        return gender_logits, age_logits, emotion_logits
+        return age_logits, gender_logits, emotion_logits
 
 
     def load_heads(self, gender_ckpt_path=None, age_ckpt_path=None, emotion_ckpt_path=None, device='cpu'):

@@ -38,8 +38,8 @@ from torch.utils.data import random_split
 from torch.utils.data import Subset
 from torch.utils.data import WeightedRandomSampler
 from sklearn.model_selection import train_test_split
-
-
+from tqdm import tqdm
+MISSING_LABEL = -100
 PATH_COLUMN = 0
 GENDER_COLUMN = 1
 AGE_COLUMN = 2 
@@ -223,32 +223,43 @@ class CombinedDataset(Dataset):
     
     """
     def __init__(self,
-                 age_csv_path,
                  gender_csv_path,
                  emotion_csv_path,
                  transform,
                  root_dir='/user/asessa/dataset tesi/',
-                 keep=0.2,
+                 keep=0.01,
                  return_path=False):
 
         # age_df = pd.read_csv(age_csv_path)
         # the gender csv contains every sample of the age csv
-        gender_df = pd.read_csv(gender_csv_path)
-        if keep <= 1.0:
-            gender_df = gender_df.sample(frac=keep)
-
-        emotion_df = pd.read_csv(emotion_csv_path)
-
-        # to be able to oversample 
-        gender_df['source'] = 'gender'
-        emotion_df['source'] = 'emotion'
-
-        # there should be no duplicates
-        self.labels_df = pd.concat([emotion_df, gender_df], ignore_index=True).drop_duplicates(subset=['Path'])
-
-        
+        # so gender df is used also for age
+        self.original_gender_df = pd.read_csv(gender_csv_path)
+        self.original_emotion_df = pd.read_csv(emotion_csv_path)
+        self.keep = keep
         self.root_dir = root_dir
         self.transform = transform
+        
+        # Initial data setup
+        self.new_epoch_resample()
+
+    def _load_and_resample_gender_df(self):
+        """Internal method to load and resample the gender dataframe."""
+        if self.keep <= 1.0:
+            return self.original_gender_df.sample(frac=self.keep)
+        return self.original_gender_df.copy()
+
+    def new_epoch_resample(self):
+        """
+        Resamples the gender dataframe and rebuilds the combined labels dataframe.
+        Call this method at the start of each new epoch.
+        """
+        gender_df = self._load_and_resample_gender_df()
+        gender_df['source'] = 'gender'
+        
+        emotion_df = self.original_emotion_df.copy()
+        emotion_df['source'] = 'emotion'
+        # there should be no duplicates
+        self.labels_df = pd.concat([emotion_df, gender_df], ignore_index=True).drop_duplicates(subset=['Path'])
 
     def __len__(self):
         return len(self.labels_df)
@@ -267,7 +278,7 @@ class CombinedDataset(Dataset):
         gender_label = self.labels_df.iloc[idx, GENDER_COLUMN]
         emotion_label = self.labels_df.iloc[idx, EMOTION_COLUMN]
         
-        labels = torch.tensor([gender_label, age_label, emotion_label], dtype=torch.long)
+        labels = torch.tensor([age_label, gender_label, emotion_label], dtype=torch.long)
         
         return self.transform(image), labels
     
@@ -293,33 +304,76 @@ class CombinedDataset(Dataset):
 
         return torch.DoubleTensor(weights)
     
-    def get_inverse_weights(self):
+    def get_inverse_weights_loss(self):
         """
-        Method to obtain weights for Weighted Cross Entropy for each task.
-        This is useful for handling class imbalance in a multi-task setting.
-        
-        Returns:
-            dict: A dictionary containing weight tensors for 'Age', 'Gender', and 'Emotion'.
+        Calculates inverse weights for the current state of the dataset,
         """
         weights = {}
-        total_samples = len(self.labels_df)
 
-        # Age weights
-        class_counts_age = self.labels_df.iloc[:, AGE_COLUMN].value_counts().sort_index()
-        weights_age = total_samples / (len(age_id2label) * class_counts_age)
-        weights['Age'] = torch.tensor(weights_age.values, dtype=torch.float)
+        # --- Age weights ---
+        valid_age_labels = self.labels_df[self.labels_df.iloc[:, AGE_COLUMN] != MISSING_LABEL]
+        total_valid_age = len(valid_age_labels)
+        if total_valid_age > 0:
+            class_counts_age = valid_age_labels.iloc[:, AGE_COLUMN].value_counts()
+            weights_age = torch.zeros(len(age_id2label))
+            for class_idx, count in class_counts_age.items():
+                weights_age[int(class_idx)] = total_valid_age / (len(age_id2label) * count)
+            weights['Age'] = weights_age
 
-        # Gender weights
-        class_counts_gender = self.labels_df.iloc[:, GENDER_COLUMN].value_counts().sort_index()
-        weights_gender = total_samples / (len(gender_id2label) * class_counts_gender)
-        weights['Gender'] = torch.tensor(weights_gender.values, dtype=torch.float)
+        # --- Gender weights ---
+        valid_gender_labels = self.labels_df[self.labels_df.iloc[:, GENDER_COLUMN] != MISSING_LABEL]
+        total_valid_gender = len(valid_gender_labels)
+        if total_valid_gender > 0:
+            class_counts_gender = valid_gender_labels.iloc[:, GENDER_COLUMN].value_counts()
+            weights_gender = torch.zeros(len(gender_id2label))
+            for class_idx, count in class_counts_gender.items():
+                weights_gender[int(class_idx)] = total_valid_gender / (len(gender_id2label) * count)
+            weights['Gender'] = weights_gender
 
-        # Emotion weights
-        class_counts_emotion = self.labels_df.iloc[:, EMOTION_COLUMN].value_counts().sort_index()
-        weights_emotion = total_samples / (len(emotion_id2label) * class_counts_emotion)
-        weights['Emotion'] = torch.tensor(weights_emotion.values, dtype=torch.float)
+        # --- Emotion weights ---
+        valid_emotion_labels = self.labels_df[self.labels_df.iloc[:, EMOTION_COLUMN] != MISSING_LABEL]
+        total_valid_emotion = len(valid_emotion_labels)
+        if total_valid_emotion > 0:
+            class_counts_emotion = valid_emotion_labels.iloc[:, EMOTION_COLUMN].value_counts()
+            weights_emotion = torch.zeros(len(emotion_id2label))
+            for class_idx, count in class_counts_emotion.items():
+                weights_emotion[int(class_idx)] = total_valid_emotion / (len(emotion_id2label) * count)
+            weights['Emotion'] = weights_emotion
         
         return weights
+    
+    def get_inverse_weights_loss_mc(self, num_simulations=50):
+        """
+        Calculates robust inverse weights using a Monte Carlo simulation.
+        Returns a dictionary containing averaged weight tensors for 'Age', 'Gender', and 'Emotion'.
+        """
+        print(f"Running Monte Carlo simulation for inverse weights with {num_simulations} iterations...")
+        
+        sum_weights = {
+            'Age': torch.zeros(len(age_id2label)),
+            'Gender': torch.zeros(len(gender_id2label)),
+            'Emotion': torch.zeros(len(emotion_id2label))
+        }
+        sim_counts = {'Age': 0, 'Gender': 0, 'Emotion': 0}
+
+        for _ in tqdm(range(num_simulations), desc="MC Simulation"):
+            self.new_epoch_resample()
+            current_weights = self.get_inverse_weights_loss()
+            
+            # Add to the running total for each task if weights were calculated
+            for task, weights_tensor in current_weights.items():
+                sum_weights[task] += weights_tensor
+                sim_counts[task] += 1
+
+        # Average the weights, only dividing by the number of simulations where weights were present
+        avg_weights = {}
+        for task in sum_weights.keys():
+            avg_weights[task] = sum_weights[task] / sim_counts[task]
+
+
+        self.new_epoch_resample()
+        print("Monte Carlo simulation complete.")
+        return avg_weights
 
 
 def resample(dataset_train, dataset_val, batch_size, target_samples_per_class_train, target_samples_per_class_val, num_workers):
@@ -373,12 +427,16 @@ if __name__ == '__main__':
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
     
-    age_csv_path ='/user/asessa/dataset tesi/datasets_with_standard_labels/age_labels.csv'
-    emotion_csv_path ='/user/asessa/dataset tesi/datasets_with_standard_labels/emotion_labels.csv'
-    gender_csv_path ='/user/asessa/dataset tesi/datasets_with_standard_labels/gender_labels.csv'
+    age_csv_path ='/user/asessa/dataset tesi/datasets_with_standard_labels/age_labels_cropped.csv'
+    emotion_csv_path ='/user/asessa/dataset tesi/emotion_labels_cropped.csv'
+    gender_csv_path ='/user/asessa/dataset tesi/gender_labels_cropped.csv'
     
-    dataset = CombinedDataset(age_csv_path, gender_csv_path, emotion_csv_path, my_transforms)
+    dataset = CombinedDataset(gender_csv_path, emotion_csv_path, my_transforms)
+
+    print(dataset.get_inverse_weights_loss_mc())
+
     sampler_weights = dataset.get_sampler_weights()
+    print(f'{len(sampler_weights)}\n{sampler_weights.shape}')
     sampler = WeightedRandomSampler(
         weights=sampler_weights,
         num_samples=len(sampler_weights),
@@ -389,7 +447,6 @@ if __name__ == '__main__':
     dataloader = DataLoader(
         dataset,
         batch_size=32,
-        shuffle=False,
         sampler=sampler
     )
 
@@ -400,7 +457,7 @@ if __name__ == '__main__':
         print(labels)
 
         i += 1
-        if i == 10:
+        if i == 1:
             break
 
     
