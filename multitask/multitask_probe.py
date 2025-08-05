@@ -139,7 +139,6 @@ class MultiTaskProbe(nn.Module):
     def save(self, path: str, epoch: int, optimizer: torch.optim.Optimizer, scheduler : torch.optim.lr_scheduler):
         """Saves a checkpoint containing ONLY the trainable weights and optimizer state."""
         try:
-            path = f'{path}/mtl_{self.backbone_type}_{epoch}.pt'
             trainable_state_dict = { name: param for name, param in self.named_parameters() if param.requires_grad }
             checkpoint = {
                 'epoch': epoch, 'model_state_dict': trainable_state_dict, 'optimizer_state_dict': optimizer.state_dict(),
