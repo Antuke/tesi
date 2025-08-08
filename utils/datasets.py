@@ -227,7 +227,7 @@ class CombinedDataset(Dataset):
                  emotion_csv_path,
                  transform,
                  root_dir='/user/asessa/dataset tesi/',
-                 keep=0.01,
+                 keep=0.1,
                  return_path=False):
 
         # age_df = pd.read_csv(age_csv_path)
@@ -420,20 +420,162 @@ def get_loaders(full_dataset, generator, batch_size, split = [0.8,0.2]):
 
     return train_loader, val_loader
 
+import torchvision.transforms as transforms
+import math
+
+
+PATH_COLUMN = 1
+GENDER_COLUMN = 2
+AGE_COLUMN = 3 
+EMOTION_COLUMN = 5
+
+class MTLDataset(Dataset):
+    def __init__(self, csv_path, transform , balance_on="Facial Emotion", augment=True, root_dir= "/user/asessa/dataset tesi/", balance=True):
+        self.labels_df = pd.read_csv(csv_path)
+        self.transform = transform 
+        self.root_dir = root_dir
+        if augment: 
+            self.transform = transforms.Compose([ 
+                transforms.RandomHorizontalFlip(), 
+                *transform.transforms 
+            ])
+        if balance: 
+            self._balance_dataset(column_name=balance_on)
+
+    def _balance_dataset(self, column_name, target_percentage=0.33):
+        """Duplicates samples with valid labels in the specified column to meet the target percentage."""
+        print(f"Balancing dataset on column: '{column_name}' to reach at least {target_percentage*100:.1f}% valid samples.")
+            
+        # Identify valid and invalid samples
+        valid_samples_df = self.labels_df[self.labels_df[column_name] != MISSING_LABEL ]
+            
+        num_valid = len(valid_samples_df)
+        num_total = len(self.labels_df)
+        current_percentage = num_valid / num_total 
+
+        print(f"Initial state: {num_valid} valid samples out of {num_total} ({current_percentage*100:.1f}%).")
+
+        # Check if balancing is needed
+        if current_percentage >= target_percentage:
+            print("Target percentage already met. No balancing needed.")
+            return
+
+        # Calculate how many samples need to be added
+        # Formula derived from: (num_valid + N) / (num_total + N) = target
+        num_to_add = math.ceil((target_percentage * num_total - num_valid) / (1 - target_percentage))
+            
+        if num_to_add <= 0:
+            return
+
+        print(f"Need to add {num_to_add} samples with valid '{column_name}' labels.")
+
+        # Duplicate random samples from the valid ones
+ 
+        samples_to_add = valid_samples_df.sample(n=num_to_add, replace=True)
+                
+        # Append the new samples and shuffle the dataset
+        self.labels_df = pd.concat([self.labels_df, samples_to_add], ignore_index=True)
+        self.labels_df = self.labels_df.sample(frac=1).reset_index(drop=True) # Shuffle
+                
+        new_total = len(self.labels_df)
+        new_valid = len(self.labels_df[self.labels_df[column_name] != MISSING_LABEL ])
+        print(f"Balancing complete. New total samples: {new_total}. New valid samples: {new_valid} ({(new_valid/new_total)*100:.1f}%).")
+
+    def get_inverse_weights_loss(self):
+
+        weights = {}
+        # --- Age weights ---
+        valid_age_labels = self.labels_df[self.labels_df.iloc[:, AGE_COLUMN] != MISSING_LABEL]
+        total_valid_age = len(valid_age_labels)
+        if total_valid_age > 0:
+            class_counts_age = valid_age_labels.iloc[:, AGE_COLUMN].value_counts()
+            weights_age = torch.zeros(len(age_id2label))
+            for class_idx, count in class_counts_age.items():
+                weights_age[int(class_idx)] = total_valid_age / (len(age_id2label) * count)
+            weights['Age'] = weights_age
+
+        # --- Gender weights ---
+        valid_gender_labels = self.labels_df[self.labels_df.iloc[:, GENDER_COLUMN] != MISSING_LABEL]
+        total_valid_gender = len(valid_gender_labels)
+        if total_valid_gender > 0:
+            class_counts_gender = valid_gender_labels.iloc[:, GENDER_COLUMN].value_counts()
+            weights_gender = torch.zeros(len(gender_id2label))
+            for class_idx, count in class_counts_gender.items():
+                weights_gender[int(class_idx)] = total_valid_gender / (len(gender_id2label) * count)
+            weights['Gender'] = weights_gender
+
+        # --- Emotion weights ---
+        valid_emotion_labels = self.labels_df[self.labels_df.iloc[:, EMOTION_COLUMN] != MISSING_LABEL]
+        total_valid_emotion = len(valid_emotion_labels)
+        if total_valid_emotion > 0:
+            class_counts_emotion = valid_emotion_labels.iloc[:, EMOTION_COLUMN].value_counts()
+            weights_emotion = torch.zeros(len(emotion_id2label))
+            for class_idx, count in class_counts_emotion.items():
+                weights_emotion[int(class_idx)] = total_valid_emotion / (len(emotion_id2label) * count)
+            weights['Emotion'] = weights_emotion
+        
+        return weights
+
+
+
+    def __len__(self):
+        return len(self.labels_df)
+
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+            
+        # Load image
+        # Column 0 in the merged dataframe is 'Path'
+        relative_img_path = self.labels_df.iloc[idx, PATH_COLUMN]
+
+        img_path = self.root_dir + relative_img_path
+        image = Image.open(img_path)
+
+        age_label = self.labels_df.iloc[idx, AGE_COLUMN]
+        gender_label = self.labels_df.iloc[idx, GENDER_COLUMN]
+        emotion_label = self.labels_df.iloc[idx, EMOTION_COLUMN]
+        
+        labels = torch.tensor([age_label, gender_label, emotion_label], dtype=torch.long)
+        
+        return self.transform(image), labels
+
 if __name__ == '__main__':
+
+    
     my_transforms = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-    
+
+    dataset = MTLDataset(csv_path="/user/asessa/test_folder/train/train.csv",transform=my_transforms)
+    dataloader = DataLoader(dataset=dataset, batch_size=64)
+    loader = tqdm(dataloader)
+    total_samples_processed = 0
+    valid_emotion_samples = 0
+    for im, labels in loader:
+        emotion_labels = labels[:, 2] # Emotion is the 3rd element (index 2)
+            
+        valid_count_in_batch = (emotion_labels != -100).sum().item()
+            
+        valid_emotion_samples += valid_count_in_batch
+        total_samples_processed += len(labels)
+
+    final_percentage = valid_emotion_samples / total_samples_processed 
+    print("\n--- VERIFICATION RESULTS ---")
+    print(f"Total samples in final dataset: {total_samples_processed}")
+    print(f"Samples with valid emotion label: {valid_emotion_samples}")
+    print(f"Final percentage of valid samples: {final_percentage:.2%}")
+
+    exit()
     age_csv_path ='/user/asessa/dataset tesi/datasets_with_standard_labels/age_labels_cropped.csv'
     emotion_csv_path ='/user/asessa/dataset tesi/emotion_labels_cropped.csv'
     gender_csv_path ='/user/asessa/dataset tesi/gender_labels_cropped.csv'
     
-    dataset = CombinedDataset(gender_csv_path, emotion_csv_path, my_transforms)
+    dataset = CombinedDataset(gender_csv_path, emotion_csv_path, my_transforms, keep=1.0)
 
-    print(dataset.get_inverse_weights_loss_mc())
+    # print(dataset.get_inverse_weights_loss_mc())
 
     sampler_weights = dataset.get_sampler_weights()
     print(f'{len(sampler_weights)}\n{sampler_weights.shape}')
@@ -446,18 +588,12 @@ if __name__ == '__main__':
 
     dataloader = DataLoader(
         dataset,
-        batch_size=32,
-        sampler=sampler
+        batch_size=128,
     )
 
     # Start timing
 
-    i = 0
-    for images, labels in dataloader:
-        print(labels)
-
-        i += 1
-        if i == 1:
-            break
-
+    loader = tqdm(dataloader)
+    for images, labels in loader:
+        pass
     
