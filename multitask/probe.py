@@ -1,3 +1,6 @@
+"""This files contains the MultiTaskProbe class, that is configured to handle the three multi-task probing approach 
+that have been experimented in this project."""
+
 import argparse
 import sys
 import os
@@ -21,9 +24,9 @@ import torch.nn as nn
 from core.vision_encoder import pe 
 from multitask.moe_task_aware import MoELayerTaskAware, ExpertPe, ExpertSiglip
 from utils.commons import *
+from multitask.wrappers import SigLIPKMoeHead, SigLIPKProbeHead, PEMoeViT
 
-
-DROPOUT_P = 0.1
+DROPOUT_P = 0.0
 GENDERS_NUM = 2
 EMOTIONS_NUM = 7
 AGE_GROUPS_NUM = 9
@@ -75,10 +78,8 @@ class PEStrategy(BackboneStrategy):
                 for param in block.parameters():
                     param.requires_grad = True
 
-    def enable_moe(self, num_experts: int, top_k: int):
-        self.backbone.attn_pool = convert_pe_pooling_to_moe(
-            self.backbone.attn_pool, self.num_tasks, num_experts=num_experts, top_k=top_k
-        )
+    def enable_moe(self, num_tasks: int, num_experts: int, top_k: int):
+        self.backbone = PEMoeViT(self.backbone, num_tasks=num_tasks, num_experts=num_experts, top_k=top_k)
 
     def enable_k_probes(self):
         original_probe = self.backbone.attn_pool.probe.data
@@ -90,115 +91,13 @@ class PEStrategy(BackboneStrategy):
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Dict]]:
         # Assumes the MoE layer, if enabled, returns the balancing loss
-        # The 'modified' flag was ambiguous, simplifying to a consistent output format
-        output = self.backbone(x, modified=True)
+        output = self.backbone(x)
         if isinstance(output, tuple): # MoE case
             shared_features, balancing_loss, stats = output
             return shared_features, balancing_loss, stats
         else: # Standard case
             return output, None, None
 
-
-class _SigLIPKProbeHead(nn.Module):
-    """
-    This module wraps the original SigLIP head layers to return all probe outputs.
-    """
-    def __init__(self, original_head: nn.Module):
-        super().__init__()
-        # Copy necessary layers and parameters from the original head
-        self.probe = original_head.probe
-        self.attention = original_head.attention
-        self.layernorm = original_head.layernorm
-        self.mlp = original_head.mlp
-
-    def forward(self, hidden_state: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        batch_size = hidden_state.shape[0]
-        # The k-probes are already part of self.probe, so we just repeat for the batch
-        probe = self.probe.repeat(batch_size, 1, 1)
-
-
-        if attention_mask is not None:
-            raise ValueError("Custom SigLIP k-probe head does not support attention_mask.")
-
-        hidden_state = self.attention(probe, hidden_state, hidden_state)[0]
-        residual = hidden_state
-        hidden_state = self.layernorm(hidden_state)
-        hidden_state = residual + self.mlp(hidden_state)
-        
-        # Return the entire tensor of shape [batch_size, num_probes, hidden_dim]
-        return hidden_state
-
-class _SigLIPKMoeHead(nn.Module):
-    """
-    A wrapper class that converts a standard Siglip2 pooling head into a
-    multi-task MoE-based head.
-    """
-    def __init__(
-        self, 
-        original_pooler: nn.Module, # Expects a Siglip2MultiheadAttentionPoolingHead
-        num_tasks: int,
-        num_experts: int,
-        top_k: int
-    ):
-        super().__init__()
-        
-
-        self.attention = original_pooler.attention
-        # self.num_heads = original_pooler.num_heads 
-        self.layernorm = original_pooler.layernorm
-
-
-        original_probe_data = original_pooler.probe.data
-        new_probe_data = original_probe_data.repeat(1, num_tasks, 1)
-        self.probe = nn.Parameter(new_probe_data)
-
-        
-        config = original_pooler.mlp.config
-        hidden_size = config.hidden_size
-        intermediate_size = config.intermediate_size
-        
-
-        # new MoE layer
-        self.mlp = MoELayerTaskAware(
-            input_dim=hidden_size,
-            hidden_dim=intermediate_size,
-            output_dim=hidden_size,
-            num_experts=num_experts,
-            num_tasks=num_tasks,
-            top_k=top_k,
-            expert_class = ExpertSiglip
-        )
-        
-        # Seed the new experts with the weights from the original MLP
-        original_mlp_weights = original_pooler.mlp.state_dict()
-        for i in range(num_experts):
-            self.mlp.experts[i].fc1.weight.data.copy_(original_mlp_weights['fc1.weight'])
-            self.mlp.experts[i].fc1.bias.data.copy_(original_mlp_weights['fc1.bias'])
-            self.mlp.experts[i].fc2.weight.data.copy_(original_mlp_weights['fc2.weight'])
-            self.mlp.experts[i].fc2.bias.data.copy_(original_mlp_weights['fc2.bias'])
-  
-
-
-    def forward(self, hidden_state: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
-        """
-        The new forward pass that handles MoE logic.
-        """
-        batch_size = hidden_state.shape[0]
-        probe = self.probe.repeat(batch_size, 1, 1)
-
-        if attention_mask is not None:
-            raise ValueError("Custom SigLIP k-probe head does not support attention_mask.")
-
-        attn_output = self.attention(probe, hidden_state, hidden_state, attn_mask=attention_mask)[0]
-
-        residual = attn_output
-        layernorm_output = self.layernorm(attn_output)
-        
-        moe_output, moe_loss, moe_stats = self.mlp(layernorm_output)
-        
-        hidden_state = residual + moe_output
-        
-        return hidden_state, moe_loss, moe_stats
 
 
 class SigLIPStrategy(BackboneStrategy):
@@ -215,14 +114,14 @@ class SigLIPStrategy(BackboneStrategy):
                     param.requires_grad = True
 
     def enable_moe(self, num_tasks, num_experts: int, top_k: int):
-        self.backbone.head = _SigLIPKMoeHead(self.backbone.head, num_tasks=num_tasks, num_experts=num_experts, top_k=top_k)
+        self.backbone.head = SigLIPKMoeHead(self.backbone.head, num_tasks=num_tasks, num_experts=num_experts, top_k=top_k)
 
 
     def enable_k_probes(self):
         original_probe = self.backbone.head.probe.data
         new_probes = original_probe.repeat(1, self.num_tasks, 1)
         self.backbone.head.probe = nn.Parameter(new_probes)
-        self.backbone.head = _SigLIPKProbeHead(self.backbone.head)
+        self.backbone.head = SigLIPKProbeHead(self.backbone.head)
 
     def get_probe(self) -> nn.Parameter:
         return self.backbone.head.probe.data
@@ -276,13 +175,14 @@ class MultiTaskProbe(nn.Module):
         self.num_tasks = len(tasks)
         self.use_k_probes = use_k_probes
         self.use_moe = use_moe
-        print(self.tasks.items())
         self.heads = nn.ModuleDict({
             task_name: _get_classifier_head(backbone_output_dim, out_dim, DROPOUT_P)
             for task_name, out_dim in self.tasks.items()
         })
         self.strategy = backbone_strategy_factory(self.backbone, self.num_tasks)      
         self._setup_layers(num_layers_to_unfreeze, moe_num_experts, moe_top_k)
+        # used for Uncertainty Weights
+        self.log_var = nn.Parameter(torch.zeros(self.num_tasks))
 
     def _setup_layers(self, num_layers_to_unfreeze: int, moe_num_experts: int, moe_top_k: int):
         """Freezes backbone and delegates setup to the selected strategy."""
@@ -398,7 +298,8 @@ if __name__ == '__main__':
     print("--- Testing MoE Multitask Probe ---")
     device = 'cuda'
     tasks = {'age': AGE_GROUPS_NUM, 'gender': GENDERS_NUM, 'emotion': EMOTIONS_NUM}
-    backbone_moe, _, hidden_size_moe = get_backbone('google/Siglip2-base-patch16-224')
+    #google/Siglip2-base-patch16-224 /  'PE-Core-B16-224'
+    backbone_moe, _, hidden_size_moe = get_backbone('PE-Core-B16-224')
     model_moe = MultiTaskProbe(
         backbone=backbone_moe,
         backbone_output_dim=hidden_size_moe,

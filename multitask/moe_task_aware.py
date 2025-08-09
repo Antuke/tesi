@@ -1,3 +1,6 @@
+"""This files implements the MoELayerTaskAware module"""
+
+
 import torch, sys, os
 import torch.nn as nn
 import torch.nn.functional as F
@@ -35,16 +38,20 @@ class ExpertPe(nn.Module):
     def forward(self, x):
         return self.fc2(self.gelu(self.fc1(x)))
 
+
 class TaskAwareGating(nn.Module):
-    """Return gating probabilities, given a [batch, num_task, dimension] tensor"""
+    """Return gating probabilities, given a [batch, num_task, emb_dimension] tensor.
+    In our approach, each task has it's associated token """
     def __init__(self, input_dim, num_experts, num_tasks):
         super().__init__()
         self.gating_weights = nn.Parameter(torch.randn(num_tasks, num_experts, input_dim))
     def forward(self, x):
-        # [batch, num_task, dimension] @ [tasks, num_experts, dimension] = [batch, num_task, experts]
+        # [batch, num_task, dimension] @ [num_task, num_experts, dimension] = [batch, num_task, experts]
         return torch.einsum('btd,ted->bte', x, self.gating_weights)
 
 class MoELayerTaskAware(nn.Module):
+    """Shared Experts, individual gate. Each token received as input is assumed to be a task-embedding produces my the 
+    MHCA pooling layer with k-learnable queries, one per task. So each token is routed by an individual gate. """
     def __init__(self, input_dim, hidden_dim, output_dim, num_experts, num_tasks, expert_class, top_k=2):
         super().__init__()
         self.num_experts = num_experts
@@ -110,7 +117,7 @@ class MoELayerTaskAware(nn.Module):
             
         return stats
 
-    def forward(self, x):
+    def forward(self, x, calculate_gate_stats=False):
         batch_size, seq_len, _ = x.shape # [batch_size, num_task, embed_dim]
         assert seq_len == self.num_tasks, "Input sequence length must match the number of tasks"
 
@@ -127,6 +134,7 @@ class MoELayerTaskAware(nn.Module):
 
         if self.training:
             aux_loss = self.compute_load_balance_loss(gating_logits)
+        if calculate_gate_stats:
             gate_stats = self.compute_gate_stats(top_k_indices)
 
         x_flat = x.view(-1, self.input_dim) # [batch_size * num_task, embed_dim]
@@ -169,12 +177,15 @@ class MoELayerTaskAware(nn.Module):
         
         return final_output, aux_loss, gate_stats
 
+
+""" 
+ 
 def convert_attention_pooling_to_moe_siglip(attention_pooling_head, num_tasks: int, num_experts: int, top_k: int, backbone_type: str):
-    """
+    
     Performs in-place modification of a pre-trained AttentionPooling instance,
     replacing its MLP with a task-aware MoE layer and changing the number of probe queries to the number of task.
     For Perception Encoder.
-    """
+    
     
     # --- 1. Save the pre-trained MLP weights BEFORE replacing the module ---
     print("Saving pre-trained MLP weights...")
@@ -239,11 +250,11 @@ def convert_attention_pooling_to_moe_siglip(attention_pooling_head, num_tasks: i
 
 
 def convert_pe_pooling_to_moe(attention_pooling_head, num_tasks: int, num_experts: int, top_k: int):
-    """
+    
     Performs in-place modification of a pre-trained AttentionPooling instance,
     replacing its MLP with a task-aware MoE layer and changing the number of probe queries to the number of task.
     For Perception Encoder.
-    """
+    
     
     # --- 1. Save the pre-trained MLP weights BEFORE replacing the module ---
     print("Saving pre-trained MLP weights...")
@@ -312,7 +323,7 @@ def convert_siglip_pooling_to_moe(
     num_experts: int, 
     top_k: int
 ):
-    """
+    
     Performs in-place modification of a pre-trained Siglip2 pooling head,
     replacing its MLP with a task-aware MoE layer.
 
@@ -324,7 +335,7 @@ def convert_siglip_pooling_to_moe(
 
     Returns:
         The modified pooler instance.
-    """
+    
     print("--- Starting Siglip2 Model Surgery ---")
     
     # Extract config from the old MLP
@@ -409,3 +420,6 @@ def convert_siglip_pooling_to_moe(
     print("--- Siglip2 Model Surgery Complete ---")
     
     return pooler
+
+
+"""

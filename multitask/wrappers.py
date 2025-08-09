@@ -31,6 +31,7 @@ class SigLIPKProbeHead(nn.Module):
         # Copy necessary layers and parameters from the original head
         self.probe = original_head.probe
         self.attention = original_head.attention
+        
         self.layernorm = original_head.layernorm
         self.mlp = original_head.mlp
 
@@ -69,7 +70,7 @@ class SigLIPKMoeHead(nn.Module):
         self.attention = original_pooler.attention
         # self.num_heads = original_pooler.num_heads 
         self.layernorm = original_pooler.layernorm
-
+    
 
         original_probe_data = original_pooler.probe.data
         new_probe_data = original_probe_data.repeat(1, num_tasks, 1)
