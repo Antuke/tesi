@@ -444,7 +444,7 @@ class MTLDataset(Dataset):
 
     def _balance_dataset(self, column_name, target_percentage=0.33):
         """Duplicates samples with valid labels in the specified column to meet the target percentage."""
-        print(f"Balancing dataset on column: '{column_name}' to reach at least {target_percentage*100:.1f}% valid samples.")
+        print(f"[DATASET] Balancing dataset on column: '{column_name}' to reach at least {target_percentage*100:.1f}% valid samples.")
             
         # Identify valid and invalid samples
         valid_samples_df = self.labels_df[self.labels_df[column_name] != MISSING_LABEL ]
@@ -453,11 +453,11 @@ class MTLDataset(Dataset):
         num_total = len(self.labels_df)
         current_percentage = num_valid / num_total 
 
-        print(f"Initial state: {num_valid} valid samples out of {num_total} ({current_percentage*100:.1f}%).")
+        print(f"[DATASET] Initial state: {num_valid} valid samples out of {num_total} ({current_percentage*100:.1f}%).")
 
         # Check if balancing is needed
         if current_percentage >= target_percentage:
-            print("Target percentage already met. No balancing needed.")
+            print("[DATASET] Target percentage already met. No balancing needed.")
             return
 
         # Calculate how many samples need to be added
@@ -467,7 +467,7 @@ class MTLDataset(Dataset):
         if num_to_add <= 0:
             return
 
-        print(f"Need to add {num_to_add} samples with valid '{column_name}' labels.")
+        print(f"[DATASET] Need to add {num_to_add} samples with valid '{column_name}' labels.")
 
         # Duplicate random samples from the valid ones
  
@@ -479,7 +479,7 @@ class MTLDataset(Dataset):
                 
         new_total = len(self.labels_df)
         new_valid = len(self.labels_df[self.labels_df[column_name] != MISSING_LABEL ])
-        print(f"Balancing complete. New total samples: {new_total}. New valid samples: {new_valid} ({(new_valid/new_total)*100:.1f}%).")
+        print(f"[DATASET] Balancing complete. New total samples: {new_total}. New valid samples: {new_valid} ({(new_valid/new_total)*100:.1f}%).")
 
     def get_inverse_weights_loss(self):
 
@@ -529,7 +529,7 @@ class MTLDataset(Dataset):
         # Column 0 in the merged dataframe is 'Path'
         relative_img_path = self.labels_df.iloc[idx, PATH_COLUMN]
 
-        img_path = self.root_dir + relative_img_path
+        img_path = self.root_dir / relative_img_path
         image = Image.open(img_path)
 
         age_label = self.labels_df.iloc[idx, AGE_COLUMN]

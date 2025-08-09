@@ -20,7 +20,7 @@ from torch.optim import Optimizer
 from torch.utils.data import random_split
 from PIL import Image
 from torch.optim.lr_scheduler import _LRScheduler
-
+import numpy as np
 
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -33,22 +33,28 @@ def _get_backbone_pe(ckpt, version):
     backbone.load_ckpt(ckpt)
     return backbone, transform, backbone_config.output_dim
 
-def get_backbone_pe(version):
+def get_backbone_pe(version, print_info=False):
     """
     Load PE ViT model, return model, transforms and size of output (dimension of embedding of last token)
     """
     backbone = pe.VisionTransformer.from_config(version, pretrained=True)
     backbone_config = PE_VISION_CONFIG[version]
     transform = transforms_pe.get_image_transform_fix(image_size=backbone_config.image_size)
+
+    if print_info:
+        attnpool= backbone.attn_pool
+        print(f'embed_dim={attnpool.embed_dim}\nnum_heads={attnpool.num_heads}')
+        print(f'OUTPUT DIM = {backbone_config.output_dim}')
     return backbone, transform, backbone_config.output_dim
 
-def get_backbone_siglip2(model_name: str='google/siglip2-base-patch16-224'):
+def get_backbone_siglip2(model_name: str='google/siglip2-base-patch16-224',print_info=False):
     """
     Load siglip2 ViT model, return model, transforms and size of output (dimension of embedding of last token)
     """
     print(f"Loading Hugging Face model: {model_name}")
     processor = AutoProcessor.from_pretrained(model_name)
-
+    if print_info:
+        print(f'SIGLIP PROCESSOR:\n******************\n {processor.image_processor}\n******************\n')
 
     # Extract image processing configuration from the loaded processor
     image_processor_config = processor.image_processor
@@ -66,6 +72,12 @@ def get_backbone_siglip2(model_name: str='google/siglip2-base-patch16-224'):
     # Load the model and return only the vision backbone
     model = AutoModel.from_pretrained(model_name)
     vision_model = model.vision_model
+
+    if print_info:
+        print(f'\nVISION CONFIGS:\n{vision_model.config}')
+        print(f'\n\n***************MHAP\n{vision_model.head}')
+
+
     return vision_model, transform, vision_model.config.hidden_size
 
 def _convert_to_rgb(image: Image.Image) -> Image.Image:
@@ -156,3 +168,68 @@ def convert_labels(labels):
             # Handle any unexpected labels
             new_labels.append(label)
     return new_labels
+
+
+def hist(gate_Stats):
+    """
+    gate_Stats = {
+        'gate_0': torch.tensor([124842.,  79691.,  42921.,  21525.,  40396., 217487., 155440.,  12710.]),
+        'gate_1': torch.tensor([ 87632., 165969.,  66953., 165881.,  85621.,  15755., 102118.,   5083.]),
+        'gate_2': torch.tensor([ 39121.,  25036., 160857.,  20101., 185666.,  13659.,   9452., 241120.])
+    }
+    """
+
+    # --- Setup for plotting ---
+    output_dir = 'moe_activation_charts'
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    expert_labels = [f'Expert {i}' for i in range(8)]
+    x_pos = np.arange(len(expert_labels))
+
+    # --- Plot 1, 2, 3: Bar Chart for Each Individual Gate ---
+    print("Generating individual gate activation charts...")
+    for gate_name, data in gate_Stats.items():
+        plt.figure(figsize=(12, 7))
+        
+        plt.bar(x_pos, data.numpy(), edgecolor='black', color='royalblue')
+        
+        plt.title(f'Activations for {gate_name}')
+        plt.xlabel('Expert')
+        plt.ylabel('Activation Value')
+        plt.xticks(x_pos, expert_labels, rotation=45, ha="right")
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        
+        plt.tight_layout()
+        
+        # Save the individual chart to a file
+        chart_path = os.path.join(output_dir, f'{gate_name}_activations.png')
+        plt.savefig(chart_path)
+        print(f"-> Saved chart to: {chart_path}")
+        plt.close() # Close the figure to free up memory
+
+    # --- Plot 4: Bar Chart of the Summed Activations ---
+    print("\nGenerating summed activation chart...")
+
+    # Calculate the element-wise sum of the tensors
+    summed_activations = gate_Stats['gate_0'] + gate_Stats['gate_1'] + gate_Stats['gate_2']
+
+    plt.figure(figsize=(12, 7))
+
+    plt.bar(x_pos, summed_activations.numpy(), color='teal', edgecolor='black')
+
+    plt.title('Total Activation per Expert (Sum of All Gates)')
+    plt.xlabel('Expert')
+    plt.ylabel('Total Activation Value')
+    plt.xticks(x_pos, expert_labels, rotation=45, ha="right")
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+    plt.tight_layout()
+
+    # Save the summed chart to a file
+    summed_chart_path = os.path.join(output_dir, 'summed_activations.png')
+    plt.savefig(summed_chart_path)
+    print(f"-> Saved summed chart to: {summed_chart_path}")
+    plt.close()
+
+    print("\nAll charts have been saved successfully.")
