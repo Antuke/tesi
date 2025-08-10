@@ -10,7 +10,7 @@ import torch.nn as nn
 import sys 
 from torch.optim import Optimizer
 import core.vision_encoder.pe as pe
-DROPOUT_P = 0.1
+DROPOUT_P = 0.3
 class Probe(nn.Module):
     """
     A probe to attach to a backbone model.

@@ -22,11 +22,10 @@ import torch.nn as nn
 
 
 from core.vision_encoder import pe 
-from multitask.moe_task_aware import MoELayerTaskAware, ExpertPe, ExpertSiglip
 from utils.commons import *
 from multitask.wrappers import SigLIPKMoeHead, SigLIPKProbeHead, PEMoeViT
 
-DROPOUT_P = 0.0
+DROPOUT_P = 0.2
 GENDERS_NUM = 2
 EMOTIONS_NUM = 7
 AGE_GROUPS_NUM = 9
@@ -39,9 +38,10 @@ class BackboneType(Enum):
 
 class BackboneStrategy(ABC):
     """Abstract base class for backbone-specific logic """
-    def __init__(self, backbone: nn.Module, num_tasks: int):
+    def __init__(self, backbone: nn.Module, num_tasks: int, task_agnostic_gate: bool):
         self.backbone = backbone
         self.num_tasks = num_tasks
+        self.task_agnostic_gate = task_agnostic_gate
 
     @abstractmethod
     def unfreeze_layers(self, num_layers_to_unfreeze: int):
@@ -79,7 +79,7 @@ class PEStrategy(BackboneStrategy):
                     param.requires_grad = True
 
     def enable_moe(self, num_tasks: int, num_experts: int, top_k: int):
-        self.backbone = PEMoeViT(self.backbone, num_tasks=num_tasks, num_experts=num_experts, top_k=top_k)
+        self.backbone = PEMoeViT(self.backbone, num_tasks=num_tasks, num_experts=num_experts, top_k=top_k, task_agnostic_gate=self.task_agnostic_gate)
 
     def enable_k_probes(self):
         original_probe = self.backbone.attn_pool.probe.data
@@ -114,7 +114,7 @@ class SigLIPStrategy(BackboneStrategy):
                     param.requires_grad = True
 
     def enable_moe(self, num_tasks, num_experts: int, top_k: int):
-        self.backbone.head = SigLIPKMoeHead(self.backbone.head, num_tasks=num_tasks, num_experts=num_experts, top_k=top_k)
+        self.backbone.head = SigLIPKMoeHead(self.backbone.head, num_tasks=num_tasks, num_experts=num_experts, top_k=top_k, task_agnostic_gate=self.task_agnostic_gate)
 
 
     def enable_k_probes(self):
@@ -225,8 +225,18 @@ class MultiTaskProbe(nn.Module):
              if ckpt_path := ckpt_paths.get(task_name):
                 try:
                     state_dict = torch.load(ckpt_path, map_location=device)
+                    model_state_dict = state_dict['model_state_dict']
+                    new_state_dict = {}
+                    for key, value in model_state_dict.items():
+                        # Remove the 'linear.1.' prefix from the keys
+                        if key.startswith('linear.1.'):
+                            new_key = key[len('linear.1.'):]
+                            new_state_dict[new_key] = value
+                        else:
+                            new_state_dict[key] = value
+
                     # The head is a Sequential(Dropout, Linear). We load into the Linear layer.
-                    head[1].load_state_dict(state_dict)
+                    head[1].load_state_dict(new_state_dict)
                     print(f"Successfully loaded weights for '{task_name}' head from {ckpt_path}")
                 except FileNotFoundError:
                     print(f"ERROR: Head checkpoint not found for '{task_name}' at '{ckpt_path}'.")

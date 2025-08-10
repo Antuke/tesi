@@ -62,7 +62,8 @@ class SigLIPKMoeHead(nn.Module):
         original_pooler: Siglip2MultiheadAttentionPoolingHead, 
         num_tasks: int,
         num_experts: int,
-        top_k: int
+        top_k: int,
+        task_agnostic_gate: bool
     ):
         super().__init__()
         
@@ -90,7 +91,8 @@ class SigLIPKMoeHead(nn.Module):
             num_experts=num_experts,
             num_tasks=num_tasks,
             top_k=top_k,
-            expert_class = ExpertSiglip
+            expert_class = ExpertSiglip,
+            task_agnostic_gate = task_agnostic_gate
         )
         
         # Seed the new experts with the weights from the original MLP
@@ -144,7 +146,8 @@ class PEMoeViT(nn.Module):
         original_vit: pe.VisionTransformer, # Expects a VisionTransformer instance
         num_tasks: int,
         num_experts: int,
-        top_k: int
+        top_k: int,
+        task_agnostic_gate: bool
     ):
         super().__init__()
         print("--- Initializing MoEVisionTransformer Wrapper ---")
@@ -174,7 +177,8 @@ class PEMoeViT(nn.Module):
             original_pooler=original_vit.attn_pool,
             num_tasks=num_tasks,
             num_experts=num_experts,
-            top_k=top_k
+            top_k=top_k,
+            task_agnostic_gate=task_agnostic_gate
         ).to('cuda')
         
         print("--- Wrapper Initialization Complete ---")
@@ -250,6 +254,7 @@ class MoEAttentionPooling(nn.Module):
         num_tasks: int,
         num_experts: int,
         top_k: int,
+        task_agnostic_gate: bool
     ):
         super().__init__()
         self.attention = original_pooler.attn
@@ -268,7 +273,8 @@ class MoEAttentionPooling(nn.Module):
             num_experts=num_experts,
             num_tasks=num_tasks,
             top_k=top_k,
-            expert_class = ExpertPe
+            expert_class = ExpertPe,
+            task_agnostic_gate = task_agnostic_gate
         )
         
         original_mlp_weights = original_pooler.mlp.state_dict()

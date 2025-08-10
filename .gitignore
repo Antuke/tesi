@@ -1,5 +1,6 @@
 __pycache__/
 outputs/
+dataset_angelo/
 .env
 *.pt
 tesi.egg-info/
@@ -9,3 +10,6 @@ tesi.egg-info/
 *tests*
 *tesi.egg*
 loss.py
+*.jpg
+*experiments*/
+*.sh

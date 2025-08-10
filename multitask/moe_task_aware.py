@@ -49,10 +49,17 @@ class TaskAwareGating(nn.Module):
         # [batch, num_task, dimension] @ [num_task, num_experts, dimension] = [batch, num_task, experts]
         return torch.einsum('btd,ted->bte', x, self.gating_weights)
 
+class TaskAgnosticGating(nn.Module):
+    def __init__(self, input_dim, num_experts):
+        super().__init__()
+        self.gating_weights = nn.Parameter(torch.randn(num_experts, input_dim))
+    def forward(self, x):
+        return torch.einsum('bsd,ed->bse', x, self.gating_weights)
+    
 class MoELayerTaskAware(nn.Module):
     """Shared Experts, individual gate. Each token received as input is assumed to be a task-embedding produces my the 
     MHCA pooling layer with k-learnable queries, one per task. So each token is routed by an individual gate. """
-    def __init__(self, input_dim, hidden_dim, output_dim, num_experts, num_tasks, expert_class, top_k=2):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_experts, num_tasks, expert_class, top_k=2, task_agnostic=False):
         super().__init__()
         self.num_experts = num_experts
         self.output_dim = output_dim
@@ -62,7 +69,9 @@ class MoELayerTaskAware(nn.Module):
 
         self.experts = nn.ModuleList([expert_class(input_dim, hidden_dim, output_dim) for _ in range(num_experts)])
         self.gating = TaskAwareGating(input_dim, num_experts, num_tasks)
-
+        if task_agnostic:
+            self.gating = TaskAgnosticGating(input_dim, num_experts)
+            
     def compute_load_balance_loss(self, gating_logits):
         """
         Computes a single, global load balancing loss across all tasks,

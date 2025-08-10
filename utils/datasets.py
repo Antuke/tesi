@@ -131,7 +131,7 @@ class BaseDataset(Dataset, ABC):
         # Use .loc for fast slicing based on the collected indices
         self.active_df = self.data_pool_df.loc[resampled_indices].reset_index(drop=True)
         
-        print(f"[Resampled] New counts:\n{self.active_df[self.stratify_on].value_counts().sort_index()}")
+        # print(f"[Resampled] New counts:\n{self.active_df[self.stratify_on].value_counts().sort_index()}")
 
     def __len__(self):
         return len(self.active_df)
@@ -143,13 +143,14 @@ class BaseDataset(Dataset, ABC):
             
             # Load image
             relative_img_path = self.active_df.iloc[idx, PATH_COLUMN]
-            img_path = self.root_dir + relative_img_path
+            img_path = self.root_dir / relative_img_path
             image = Image.open(img_path)
             
             # Get labels using abstract method
+            
             labels = self.get_labels(idx)
-            if self.return_path:
-                return self.transform(image), labels, img_path
+            #if self.return_path:
+            #     return self.transform(image), labels, img_path
 
             return self.transform(image), labels
         except Exception as e:
@@ -177,8 +178,8 @@ class AgeDataset(BaseDataset):
 
     def get_inverse_weight(self):
         """method to obtain weight for Weighted Cross Entropy."""
-        class_counts = self.labels_df.iloc[:, AGE_COLUMN].value_counts().sort_index()
-        total_samples = len(self.labels_df)
+        class_counts = self.active_df.iloc[:, AGE_COLUMN].value_counts().sort_index()
+        total_samples = len(self.active_df)
         weights = total_samples / (len(age_id2label) * class_counts)
         return torch.tensor(weights.values, dtype=torch.float)
 
@@ -192,7 +193,7 @@ class GenderDataset(BaseDataset):
     def get_inverse_weight(self):
         """method to obtain weight for Weighted Cross Entropy."""
         class_counts = self.active_df.iloc[:, GENDER_COLUMN].value_counts().sort_index()
-        total_samples = len(self.labeactive_dfls_df)
+        total_samples = len(self.active_df)
         weights = total_samples / (len(gender_id2label) * class_counts)
         return torch.tensor(weights.values, dtype=torch.float)
 
@@ -411,7 +412,6 @@ def get_loaders(full_dataset, generator, batch_size, split = [0.8,0.2]):
     train_dataset, val_dataset = random_split(
         full_dataset, [train_size, val_size], generator=generator
     )
-    print('puzzo')
     train_loader = DataLoader(train_dataset,  batch_size=batch_size,shuffle=True,
                                  num_workers=16, pin_memory=True)
     val_loader = DataLoader(val_dataset,  batch_size=batch_size,shuffle=True,
@@ -424,10 +424,10 @@ import torchvision.transforms as transforms
 import math
 
 
-PATH_COLUMN = 1
-GENDER_COLUMN = 2
-AGE_COLUMN = 3 
-EMOTION_COLUMN = 5
+PATH_COLUMN = 0
+GENDER_COLUMN = 1
+AGE_COLUMN = 2
+EMOTION_COLUMN = 4
 
 class MTLDataset(Dataset):
     def __init__(self, csv_path, transform , balance_on="Facial Emotion", augment=True, root_dir= "/user/asessa/dataset tesi/", balance=True):
@@ -535,8 +535,10 @@ class MTLDataset(Dataset):
         age_label = self.labels_df.iloc[idx, AGE_COLUMN]
         gender_label = self.labels_df.iloc[idx, GENDER_COLUMN]
         emotion_label = self.labels_df.iloc[idx, EMOTION_COLUMN]
-        
-        labels = torch.tensor([age_label, gender_label, emotion_label], dtype=torch.long)
+
+  
+
+        labels = torch.tensor([int(age_label), int(gender_label), int(emotion_label)], dtype=torch.long)
         
         return self.transform(image), labels
 

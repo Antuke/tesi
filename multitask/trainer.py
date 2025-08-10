@@ -24,7 +24,7 @@ if REPO_PATH:
 from probing.probe import Probe
 from utils.commons import log_to_disk, get_backbone
 from utils.datasets import get_split, resample, MTLDataset
-from config.task_config import TaskConfig, MTLConfig
+from config.task_config import MTLConfig
 # from multitask.multitask_probe import MultiTaskProbe
 from multitask.probe import MultiTaskProbe
 
@@ -48,6 +48,12 @@ class Trainer:
         self.version_name = 'Siglip2' if 'google' in args.version else args.version
         self.saving_interval = 10
         self.start_epoch = 0
+        # classic, k-probe, mhca-moe,
+        self.probing_type = (
+            'k-probe' if self.args.k_queries
+            else 'mhca-moe' if self.args.moe
+            else 'classic'
+        )
 
         # These will be initialized in self.setup()
         self.mtl_probe = None
@@ -58,6 +64,7 @@ class Trainer:
         self.optimizer = None
         self.scheduler = None
         self.criterions = {}
+        self.setup()
         
     def setup(self):
         """Initializes all components required for training."""
@@ -111,7 +118,7 @@ class Trainer:
             balance=False
         )
 
-        self.train_loader = DataLoader(dataset_train, batch_size=self.args.batch_size, num_workers=self.config.num_workers, pin_memory=True)
+        self.train_loader = DataLoader(dataset_train, batch_size=self.args.batch_size, num_workers=self.config.num_workers, pin_memory=True, shuffle=True)
         if self.config.num_workers == 1:
             print(f'!!!!!!NUM WORKERS IS ONLY 1!!!!!!!')
             # exit()
@@ -192,12 +199,12 @@ class Trainer:
 
     def train(self):
         """Runs the main training loop."""
-        self.setup()
+        # self.setup()
         print("\n--- Starting Training ---")
         self.config.output_folder.mkdir(parents=True, exist_ok=True)
         (self.config.output_folder / 'ckpt').mkdir(exist_ok=True)
         
-        minimum_val_accuracy = float('inf')
+        maximum_val_accuracy = -float('inf')
 
         for epoch in range(self.start_epoch, self.args.epochs):
             print(f"\nEpoch {epoch + 1}/{self.args.epochs}")
@@ -209,15 +216,15 @@ class Trainer:
             print(f"VALIDATION Avg Loss: {val_results['avg_loss']:.4f}, Task Accuracies: {val_results['accuracies']}")
 
             for task_name, cm in val_results['confusion_matrices'].items():
-                self.save_confusion_matrix(cm, task_name)
+                self.save_confusion_matrix(cm, task_name, epoch+1)
             
             self._log_epoch_results(epoch, train_results, val_results)
             
             val_accuracy = val_results['avg_accuracy']
-            if (epoch + 1) % self.saving_interval == 0 or val_accuracy < minimum_val_accuracy or (epoch + 1) == self.args.epochs:
-                if val_accuracy < minimum_val_accuracy:
+            if (epoch + 1) % self.saving_interval == 0 or val_accuracy > maximum_val_accuracy or (epoch + 1) == self.args.epochs:
+                if val_accuracy > maximum_val_accuracy:
                     print(f"[TRAINER] New best validation accuracy: {val_accuracy:.5f}. Saving model.")
-                    minimum_val_accuracy = val_accuracy
+                    maximum_val_accuracy = val_accuracy
                 
                 save_path = self.config.output_folder / 'ckpt' / f"mtl_{self.version_name}_{epoch + 1}.pt"
                 self.mtl_probe.save(path=str(save_path), epoch=epoch + 1, optimizer=self.optimizer, scheduler=self.scheduler)
@@ -231,7 +238,7 @@ class Trainer:
         test_results = self._run_epoch(self.test_loader, is_training=False, description="Testing")
         
         for task_name, cm in test_results['confusion_matrices'].items():
-            self.save_confusion_matrix(cm, task_name, is_final=True)
+            self.save_confusion_matrix(cm, task_name, 0, is_final=True)
         
         print("\n--- Test Results ---")
         print(f"Average Loss: {test_results['avg_loss']:.4f}")
@@ -284,7 +291,7 @@ class Trainer:
         with context:
             for i, (images, labels) in pbar:
                 loss, task_losses, task_outputs = self._process_batch(images, labels)
-
+                
                 if is_training:
                     self.optimizer.zero_grad()
                     loss.backward()
@@ -351,7 +358,6 @@ class Trainer:
             # to avoid to add nan to the batch loss
             if torch.isfinite(task_loss):
                 if self.config.use_uncertainty_weighting:
-                    # 1/2σ² * loss + log(σ)
                     weighted_loss = 0.5 * torch.exp(-self.mtl_probe.log_var[idx]) * task_loss + 0.5 * self.mtl_probe.log_var[idx]
                     total_loss += weighted_loss
                 elif self.config.use_grad_norm:
@@ -365,7 +371,6 @@ class Trainer:
         # Add balancing loss for MoE models
         if self.args.moe:
             total_loss += 0.05 * bal_loss
-
         return total_loss, task_losses, task_outputs
 
     def _log_epoch_results(self, epoch_idx: int, train_results: Dict, val_results: Dict):
@@ -387,22 +392,27 @@ class Trainer:
         log_to_disk(
             self.config.output_folder,
             log_string,
-            f'mtl_{self.version_name}',
+            f'mtl_{self.probing_type}_{self.version_name}',
             header=self.config.header
         )
 
-    def save_confusion_matrix(self, cm: np.ndarray, task_name: str, is_final: bool = False):
+    def save_confusion_matrix(self, cm: np.ndarray, task_name: str, epoch:int,  is_final: bool = False):
         """Saves a confusion matrix plot to disk."""
         task = self.config.task_map[task_name]
         disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=task.class_labels)
         disp.plot()
         
-        suffix = '_test_set' if is_final else ''
-        cm_path = self.config.output_folder / f'cmkprobes_mtl_{self.version_name}_{task_name}{suffix}.jpg'
+        suffix = '_test_set' if is_final else str(epoch)
+        cm_path = self.config.output_folder / f'cm_mtl_{self.probing_type}_{self.version_name}_{task_name}{suffix}.jpg'
         
         plt.savefig(cm_path, bbox_inches='tight')
         plt.close() # Close the plot to free memory
         print(f"Confusion matrix for '{task_name}' saved to {cm_path}")
+
+    def load_heads(self, ckpt_paths):
+        self.mtl_probe.load_heads(ckpt_paths)
+        self.probing_type = self.probing_type + '_pre-trained-heads_'
+
 
     @staticmethod
     def cleanup():

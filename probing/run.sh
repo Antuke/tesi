@@ -7,7 +7,7 @@ EMOTION_CSV_PATH="/user/asessa/dataset tesi/emotion_labels_cropped.csv"
 CKPT_PATH="C:\Users\antonio\Desktop\perception_models\ckpt\PE-Core-B16-224.pt"
 
 
-
+# 'PE-Core-B16-224'
 
 
 python train.py \

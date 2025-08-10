@@ -15,3 +15,4 @@ python train.py \
 
 
 
+python train.py --task emotion --version PE-Core-B16-224 --resume_from_ckpt /user/asessa/tesi/probing/experiments/emotion_classification/ckpt/lp_emotion_PE-Core-B16-224_30.pt
