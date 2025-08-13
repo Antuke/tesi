@@ -160,7 +160,6 @@ class PEMoeViT(nn.Module):
         self.transformer = original_vit.transformer
         self.ln_pre = original_vit.ln_pre
         self.ln_post = original_vit.ln_post
-        self.proj = original_vit.proj
         self.pool_type = original_vit.pool_type
         self.use_cls_token = original_vit.use_cls_token
         self.use_abs_posemb = original_vit.use_abs_posemb
@@ -180,6 +179,11 @@ class PEMoeViT(nn.Module):
             top_k=top_k,
             task_agnostic_gate=task_agnostic_gate
         ).to('cuda')
+
+        # three distinct projection matrices
+        self.proj = nn.Parameter(
+            torch.stack([original_vit.proj.clone() for _ in range(num_tasks)], dim=0)
+        )
         
         print("--- Wrapper Initialization Complete ---")
     

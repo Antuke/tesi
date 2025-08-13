@@ -186,58 +186,113 @@ class Trainer:
                 save_path = self.config.output_folder / self.ckpt_folder / f"{self.probing_type}_{self.task.name}_{self.version_name}_{epoch + 1}.pt"
                 self.probe.save(path=str(save_path), epoch=epoch + 1, optimizer=self.optimizer, scheduler=self.scheduler)
 
-    def test(self, ckpt_path=None):
-        """Evaluates the model on the test set."""
-        
+    def test(self, ckpt_path=None, k=2):
+        """Evaluates the model on the test set. Supports the computing of top-k accuracy"""
+
         self._setup_test_loader()
-        self.probe.load(self.best_path)
+        best_epoch = self.probe.load(self.best_path)
         if ckpt_path:
             self.probe.load(ckpt_path)
 
         print(f"\n--- Starting Final Testing for {self.task.name} ---")
-        test_results = self._run_epoch(self.test_loader, is_training=False, description="Testing")
         
+        save_extreme_wrong = False
+        if self.task.name == 'Age':
+            save_extreme_wrong = True
+        
+        if self.task.name == 'Gender':
+            k = 1
+
+        test_results = self._run_epoch(
+            self.test_loader,
+            is_training=False,
+            description="Testing",
+            k=k,
+            save_extreme_wrong=save_extreme_wrong
+        )
+
         self.save_confusion_matrix(test_results['confusion_matrix'], is_final=True)
-        
+
         print("\n--- Test Results ---")
         print(f"Average Loss: {test_results['loss']:.4f}")
         print(f"Final Accuracy: {test_results['accuracy']:.2f}%")
+        print(f"Top-{k} Accuracy: {test_results['top_k_accuracy']:.2f}%")
         print("Confusion Matrix:\n", test_results['confusion_matrix'])
-        self._log_epoch_results(999, None, test_results)
+        self._log_epoch_results(best_epoch, None, test_results, k=k)
 
 
-    def _run_epoch(self, loader: DataLoader, is_training: bool, description: str = "Training", epoch_idx: int = 0) -> Dict[str, Any]:
+    def _run_epoch(self, loader: DataLoader, is_training: bool, description: str = "Training", epoch_idx: int = 0, k: int = 1, save_extreme_wrong: bool = False) -> Dict[str, Any]:
         """Runs a single epoch of training or evaluation."""
         self.probe.train(is_training)
-        
+
         total_loss = 0.0
-        all_preds, all_true = [], []
-        pbar = tqdm(loader, desc=f"{description} Epoch {epoch_idx+1}")
+        all_valid_preds, all_valid_true = [], []
+        correct_top_k = 0
+        total_valid_samples = 0
+        pbar = tqdm(loader, desc=f"{description} Epoch {epoch_idx+1 if is_training else ''}")
 
         context = torch.no_grad() if not is_training else torch.enable_grad()
         with context:
-            for i, (images, labels) in enumerate(pbar):
+            for i, batch in enumerate(pbar):
+                if save_extreme_wrong or not is_training: # Path is needed for testing/validation
+                     images, labels, paths = batch
+                else:
+                     images, labels = batch
+                     paths = [None] * len(labels)
+
                 loss, outputs = self._process_batch(images, labels)
-                
+
                 if is_training:
                     self.optimizer.zero_grad()
                     loss.backward()
                     self.optimizer.step()
                     if self.scheduler:
                         self.scheduler.step(epoch_idx + i / len(loader))
-                
+
                 total_loss += loss.item()
                 pbar.set_postfix(loss=loss.item())
 
                 if not is_training:
-                    pred_indices = outputs.argmax(dim=1).cpu().numpy()
-                    all_preds.extend(pred_indices)
-                    all_true.extend(labels.cpu().numpy())
-        
+                    valid_labels_mask = labels != -100
+                    
+                    # If there are no valid labels in this batch, skip to the next one
+                    if not torch.any(valid_labels_mask):
+                        continue
+
+                    valid_labels = labels[valid_labels_mask].to(self.device)
+                    valid_outputs = outputs[valid_labels_mask]
+                    valid_paths = [path for idx, path in enumerate(paths) if valid_labels_mask[idx]]
+                    
+                    pred_indices = valid_outputs.argmax(dim=1)
+                    
+                    all_valid_preds.extend(pred_indices.cpu().numpy())
+                    all_valid_true.extend(valid_labels.cpu().numpy())
+
+                    _, top_k_preds = torch.topk(valid_outputs, k, dim=1)
+                    expanded_labels = valid_labels.view(-1, 1).expand_as(top_k_preds)
+                    correct_top_k += torch.sum(torch.any(top_k_preds == expanded_labels, dim=1)).item()
+                    total_valid_samples += valid_labels.size(0)
+
+                    if save_extreme_wrong:
+                        misclassified = pred_indices != valid_labels
+                        for idx in torch.where(misclassified)[0]:
+                            true_label = valid_labels[idx].item()
+                            pred_label = pred_indices[idx].item()
+
+                            if abs(true_label - pred_label) > 3:
+                                output_dir = self.config.output_folder / f"extreme_wrong_classifications/true_{true_label}/pred_{pred_label}"
+                                output_dir.mkdir(parents=True, exist_ok=True)
+                                
+                                original_image_tensor = images[valid_labels_mask][idx]
+                                img_path = Path(valid_paths[idx])
+                                save_image(original_image_tensor, output_dir / f"{img_path.stem}_{uuid.uuid4()}.png")
+
         results = {'loss': total_loss / len(loader)}
         if not is_training:
-            results['accuracy'] = accuracy_score(all_true, all_preds) * 100
-            results['confusion_matrix'] = confusion_matrix(all_true, all_preds, labels=range(self.task.num_classes))
+            results['accuracy'] = accuracy_score(all_valid_true, all_valid_preds) * 100 if all_valid_true else 0
+            results['confusion_matrix'] = confusion_matrix(all_valid_true, all_valid_preds, labels=range(self.task.num_classes))
+            results['top_k_accuracy'] = (correct_top_k / total_valid_samples) * 100 if total_valid_samples > 0 else 0
+            
         return results
 
     def _process_batch(self, images: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -247,10 +302,11 @@ class Trainer:
         loss = self.criterion(outputs, labels)
         return loss, outputs
 
-    def _log_epoch_results(self, epoch: int, train_results: Dict, val_results: Dict):
+    def _log_epoch_results(self, epoch: int, train_results: Dict, val_results: Dict, k: int = 1):
         """Logs the results of an epoch to a CSV file."""
         lr = self.scheduler.get_last_lr()[0] if self.scheduler else self.args.learning_rate
         if train_results:
+            header = self.config.header
             log_string = (
                 f"{epoch + 1},"
                 f"{train_results['loss']:.5f},"
@@ -258,19 +314,21 @@ class Trainer:
                 f"{val_results['accuracy']:.3f},"
                 f"{lr:.6f}"
             )
-        else:
+        else: 
+            header = f"epoch,test_loss,test_accuracy,top_{k}_accuracy,learning_rate"
             log_string = (
                 f"{epoch + 1},"
                 f"{val_results['loss']:.5f},"
                 f"{val_results['accuracy']:.3f},"
+                f"{val_results.get('top_k_accuracy', 0):.3f},"
                 f"{lr:.6f}"
             )
 
         log_to_disk(
             self.config.output_folder,
             log_string,
-            f'{self.probing_type}_{self.version_name}',
-            header=self.config.header
+            f'{self.probing_type}_{self.version_name}_testing' if not train_results else f'{self.probing_type}_{self.version_name}',
+            header=header
         )
 
     def save_confusion_matrix(self, cm: np.ndarray, epoch: int = 0, is_final: bool = False):

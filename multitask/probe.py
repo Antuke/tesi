@@ -1,11 +1,10 @@
 """This files contains the MultiTaskProbe class, that is configured to handle the three multi-task probing approach 
-that have been experimented in this project."""
+that have been experimented in this project, using the Strategy and factory pattern."""
 
-import argparse
 import sys
 import os
 import types
-from typing import List, Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple
 from abc import ABC, abstractmethod
 from enum import Enum
 
@@ -13,7 +12,6 @@ from dotenv import load_dotenv
 load_dotenv()
 sys.path.append(os.getenv("REPO_PATH"))
 
-from dotenv import load_dotenv
 import matplotlib.pyplot as plt
 import seaborn as sns
 import torch.nn.functional as F
@@ -25,10 +23,7 @@ from core.vision_encoder import pe
 from utils.commons import *
 from multitask.wrappers import SigLIPKMoeHead, SigLIPKProbeHead, PEMoeViT
 
-DROPOUT_P = 0.2
-GENDERS_NUM = 2
-EMOTIONS_NUM = 7
-AGE_GROUPS_NUM = 9
+DROPOUT_P = 0.3
 DEVICE = 'cuda' 
 
 class BackboneType(Enum):
@@ -63,20 +58,49 @@ class BackboneStrategy(ABC):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Dict]]:
         pass
 
+
 class PEStrategy(BackboneStrategy):
     """Strategy for the PE (VisionTransformer) backbone."""
     def unfreeze_layers(self, num_layers_to_unfreeze: int):
-        # Unfreezing logic is now encapsulated here
-        for param in self.backbone.attn_pool.parameters():
+        
+        named_param_groups = []
+
+        head_params = []
+        attn_pool_params = list(self.backbone.attn_pool.parameters())
+        for param in attn_pool_params:
             param.requires_grad = True
-        if num_layers_to_unfreeze > 0:
+        head_params.extend(attn_pool_params)
+
+        if self.backbone.proj:
             self.backbone.proj.requires_grad = True
-            for param in self.backbone.ln_post.parameters():
+            head_params.append(self.backbone.proj)
+
+        named_param_groups.append({'name': 'head', 'params': head_params})
+        print("Identified 'head' parameter group for PE.")
+
+        if num_layers_to_unfreeze > 0:
+            backbone_params = []
+            # Unfreeze post-layernorm
+            ln_post_params = list(self.backbone.ln_post.parameters())
+            for param in ln_post_params:
                 param.requires_grad = True
+            backbone_params.extend(ln_post_params)
+
+            # Unfreeze transformer blocks
             layers = self.backbone.transformer.resblocks
-            for block in layers[-min(len(layers), num_layers_to_unfreeze):]:
-                for param in block.parameters():
+            num_to_unfreeze = min(len(layers), num_layers_to_unfreeze)
+            print(f"Unfreezing the last {num_to_unfreeze} PE transformer blocks.")
+            for block in layers[-num_to_unfreeze:]:
+                block_params = list(block.parameters())
+                for param in block_params:
                     param.requires_grad = True
+                backbone_params.extend(block_params)
+
+            if backbone_params:
+                named_param_groups.append({'name': 'backbone', 'params': backbone_params})
+                print("Identified 'backbone' parameter group for PE.")
+
+        return named_param_groups
 
     def enable_moe(self, num_tasks: int, num_experts: int, top_k: int):
         self.backbone = PEMoeViT(self.backbone, num_tasks=num_tasks, num_experts=num_experts, top_k=top_k, task_agnostic_gate=self.task_agnostic_gate)
@@ -85,17 +109,29 @@ class PEStrategy(BackboneStrategy):
         original_probe = self.backbone.attn_pool.probe.data
         new_probes = original_probe.repeat(1, self.num_tasks, 1)
         self.backbone.attn_pool.probe = nn.Parameter(new_probes)
+        if self.backbone.proj:
+            self.backbone.proj = nn.Parameter(torch.stack([self.backbone.proj.clone() for _ in range(self.num_tasks)], dim=0)) 
+
+        def forward(self, x: torch.Tensor, **kwargs):
+            x = self.forward_features(x, norm=True, **kwargs)
+            x = self._pool(x)
+
+            if self.proj_dim is not None:
+                x = torch.einsum('bnd,ndp->bnp', x, self.proj)
+
+            return x
+
+        self.backbone.forward = types.MethodType(forward, self.backbone)
 
     def get_probe(self) -> nn.Parameter:
         return self.backbone.attn_pool.probe.data
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Dict]]:
-        # Assumes the MoE layer, if enabled, returns the balancing loss
         output = self.backbone(x)
         if isinstance(output, tuple): # MoE case
             shared_features, balancing_loss, stats = output
             return shared_features, balancing_loss, stats
-        else: # Standard case
+        else: 
             return output, None, None
 
 
@@ -103,15 +139,38 @@ class PEStrategy(BackboneStrategy):
 class SigLIPStrategy(BackboneStrategy):
     """Strategy for the SigLIP backbone."""
     def unfreeze_layers(self, num_layers_to_unfreeze: int):
-        for param in self.backbone.head.parameters():
+        named_param_groups = []
+
+        # Group 1: The final classification head
+        head_params = list(self.backbone.head.parameters())
+        for param in head_params:
             param.requires_grad = True
+        named_param_groups.append({'name': 'head', 'params': head_params})
+        print("Identified 'head' parameter group for SigLIP.")
+
         if num_layers_to_unfreeze > 0:
-            for p in self.backbone.post_layernorm.parameters():
+            backbone_params = []
+            # Unfreeze post-layernorm
+            post_ln_params = list(self.backbone.post_layernorm.parameters())
+            for p in post_ln_params:
                 p.requires_grad = True
+            backbone_params.extend(post_ln_params)
+
+            # Unfreeze transformer layers
             layers = self.backbone.encoder.layers
-            for l in layers[-min(len(layers), num_layers_to_unfreeze):]:
-                for param in l.parameters():
+            num_to_unfreeze = min(len(layers), num_layers_to_unfreeze)
+            print(f"Unfreezing the last {num_to_unfreeze} SigLIP transformer layers.")
+            for l in layers[-num_to_unfreeze:]:
+                layer_params = list(l.parameters())
+                for param in layer_params:
                     param.requires_grad = True
+                backbone_params.extend(layer_params)
+
+            if backbone_params:
+                named_param_groups.append({'name': 'backbone', 'params': backbone_params})
+                print("Identified 'backbone' parameter group for SigLIP.")
+
+        return named_param_groups
 
     def enable_moe(self, num_tasks, num_experts: int, top_k: int):
         self.backbone.head = SigLIPKMoeHead(self.backbone.head, num_tasks=num_tasks, num_experts=num_experts, top_k=top_k, task_agnostic_gate=self.task_agnostic_gate)
@@ -131,7 +190,7 @@ class SigLIPStrategy(BackboneStrategy):
         if isinstance(output, tuple): # MoE case
             shared_features, balancing_loss, stats = output
             return shared_features, balancing_loss, stats
-        else: # Standard case
+        else: 
             return output, None, None
 
 def _get_classifier_head(in_dim: int, out_dim: int, dropout_p: float = 0.0) -> nn.Sequential:
@@ -141,12 +200,12 @@ def _get_classifier_head(in_dim: int, out_dim: int, dropout_p: float = 0.0) -> n
         nn.Linear(in_dim, out_dim)
     )
 
-def backbone_strategy_factory(backbone: nn.Module, num_tasks: int) -> BackboneStrategy:
+def backbone_strategy_factory(backbone: nn.Module, num_tasks: int, task_agnostic_gate : bool) -> BackboneStrategy:
     """Factory function to select the appropriate strategy."""
     if isinstance(backbone, pe.VisionTransformer): # PE backbone
-        return PEStrategy(backbone, num_tasks)
+        return PEStrategy(backbone, num_tasks, task_agnostic_gate)
     else: # SigLIP backbone TODO add isinstance
-        return SigLIPStrategy(backbone, num_tasks)
+        return SigLIPStrategy(backbone, num_tasks, task_agnostic_gate)
 
 
 
@@ -163,7 +222,8 @@ class MultiTaskProbe(nn.Module):
                  use_k_probes: bool = False,
                  use_moe: bool = False,
                  moe_num_experts: int = 8,
-                 moe_top_k: int = 2):
+                 moe_top_k: int = 2,
+                 task_agnostic_gate: bool = False):
 
         super().__init__()
         
@@ -179,7 +239,7 @@ class MultiTaskProbe(nn.Module):
             task_name: _get_classifier_head(backbone_output_dim, out_dim, DROPOUT_P)
             for task_name, out_dim in self.tasks.items()
         })
-        self.strategy = backbone_strategy_factory(self.backbone, self.num_tasks)      
+        self.strategy = backbone_strategy_factory(self.backbone, self.num_tasks, task_agnostic_gate)      
         self._setup_layers(num_layers_to_unfreeze, moe_num_experts, moe_top_k)
         # used for Uncertainty Weights
         self.log_var = nn.Parameter(torch.zeros(self.num_tasks))
@@ -218,6 +278,8 @@ class MultiTaskProbe(nn.Module):
             return logits, balancing_loss, stats
         return logits
 
+    def unfreeze_layers(self, layers_to_unfreeze : int):
+        return self.strategy.unfreeze_layers(layers_to_unfreeze)
 
     def load_heads(self, ckpt_paths: Dict[str, str], device: str = 'cuda'):
         """Loads weights from checkpoints into the respective heads."""
@@ -228,7 +290,6 @@ class MultiTaskProbe(nn.Module):
                     model_state_dict = state_dict['model_state_dict']
                     new_state_dict = {}
                     for key, value in model_state_dict.items():
-                        # Remove the 'linear.1.' prefix from the keys
                         if key.startswith('linear.1.'):
                             new_key = key[len('linear.1.'):]
                             new_state_dict[new_key] = value
@@ -304,6 +365,12 @@ class MultiTaskProbe(nn.Module):
         plt.savefig(file_path, bbox_inches='tight', dpi=150)
         plt.close(fig)
 
+
+DROPOUT_P = 0.2
+GENDERS_NUM = 2
+EMOTIONS_NUM = 7
+AGE_GROUPS_NUM = 9
+DEVICE = 'cuda' 
 if __name__ == '__main__':
     print("--- Testing MoE Multitask Probe ---")
     device = 'cuda'

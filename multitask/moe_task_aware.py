@@ -59,7 +59,7 @@ class TaskAgnosticGating(nn.Module):
 class MoELayerTaskAware(nn.Module):
     """Shared Experts, individual gate. Each token received as input is assumed to be a task-embedding produces my the 
     MHCA pooling layer with k-learnable queries, one per task. So each token is routed by an individual gate. """
-    def __init__(self, input_dim, hidden_dim, output_dim, num_experts, num_tasks, expert_class, top_k=2, task_agnostic=False):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_experts, num_tasks, expert_class, top_k=2, task_agnostic_gate=False):
         super().__init__()
         self.num_experts = num_experts
         self.output_dim = output_dim
@@ -69,7 +69,7 @@ class MoELayerTaskAware(nn.Module):
 
         self.experts = nn.ModuleList([expert_class(input_dim, hidden_dim, output_dim) for _ in range(num_experts)])
         self.gating = TaskAwareGating(input_dim, num_experts, num_tasks)
-        if task_agnostic:
+        if task_agnostic_gate:
             self.gating = TaskAgnosticGating(input_dim, num_experts)
             
     def compute_load_balance_loss(self, gating_logits):
@@ -157,7 +157,7 @@ class MoELayerTaskAware(nn.Module):
         # Shape: [batch_size * num_tasks * top_k, embed_dim]
         
         # Route tokens to experts and get outputs
-        expert_outputs = torch.zeros_like(expanded_x) # [batch_size * num_tasks * top_k, embed_dim]
+        expert_outputs = torch.zeros(expanded_x.shape, dtype=x.dtype, device=x.device) # [batch_size * num_tasks * top_k, embed_dim]
         for i, expert in enumerate(self.experts):
             # Create a mask for all token assignments for this expert
             mask = (top_k_indices_flat == i)
@@ -168,7 +168,7 @@ class MoELayerTaskAware(nn.Module):
                 
                 # Calculate the output and place it in the correct rows
                 # of our buffer tensor.
-                expert_outputs[mask] = expert(tokens_for_expert)
+                expert_outputs[mask] = expert(tokens_for_expert).to(expert_outputs.dtype)
 
         # Flatten the weights to align with the expanded tensors
         # [batch_size * num_task * top_k]
@@ -186,249 +186,3 @@ class MoELayerTaskAware(nn.Module):
         
         return final_output, aux_loss, gate_stats
 
-
-""" 
- 
-def convert_attention_pooling_to_moe_siglip(attention_pooling_head, num_tasks: int, num_experts: int, top_k: int, backbone_type: str):
-    
-    Performs in-place modification of a pre-trained AttentionPooling instance,
-    replacing its MLP with a task-aware MoE layer and changing the number of probe queries to the number of task.
-    For Perception Encoder.
-    
-    
-    # --- 1. Save the pre-trained MLP weights BEFORE replacing the module ---
-    print("Saving pre-trained MLP weights...")
-    original_mlp_weights = attention_pooling_head.mlp.state_dict()
-    mlp_ratio = attention_pooling_head.mlp.c_fc.out_features // attention_pooling_head.embed_dim
-
-    # --- 2. Resize the probe for the desired number of tasks ---
-    print(f"Resizing attention probe from {attention_pooling_head.probe.shape[1]} to {num_tasks} tokens...")
-    # We can repeat the original probe to initialize the new ones, preserving knowledge
-    original_probe_data = attention_pooling_head.probe.data
-    new_probe_data = original_probe_data.repeat(1, num_tasks // original_probe_data.shape[1] + 1, 1)[:, :num_tasks, :]
-    attention_pooling_head.probe = nn.Parameter(new_probe_data)
-
-    # --- 3. Build the new MoE layer and seed its experts ---
-    expert_class = ExpertPe if backbone_type == 'pe' else ExpertSiglip
-    print(f"Creating new MoE layer with {num_experts} experts...")
-    moe_layer = MoELayerTaskAware(
-        input_dim=attention_pooling_head.embed_dim,
-        hidden_dim=int(attention_pooling_head.embed_dim * mlp_ratio),
-        output_dim=attention_pooling_head.embed_dim,
-        num_experts=num_experts,
-        num_tasks=num_tasks,
-        top_k=top_k,
-        expert_class = expert_class
-    )
-
-    # Seed each expert with the pre-trained MLP weights
-    for i in range(num_experts):
-        moe_layer.experts[i].fc1.weight.data.copy_(original_mlp_weights['c_fc.weight'])
-        moe_layer.experts[i].fc1.bias.data.copy_(original_mlp_weights['c_fc.bias'])
-        moe_layer.experts[i].fc2.weight.data.copy_(original_mlp_weights['c_proj.weight'])
-        moe_layer.experts[i].fc2.bias.data.copy_(original_mlp_weights['c_proj.bias'])
-    print(f"All {num_experts} experts have been seeded.")
-
-
-    attention_pooling_head.mlp = moe_layer
-
-
-    # The original forward method needs to be replaced to handle the (output, loss) tuple.
-    def moe_forward(self, x: torch.Tensor):
-        batch, _, _ = x.shape
-        q = self.probe.repeat((batch, 1, 1))
-        # This part is the same
-        attn_output = self.attn(q, x, x, need_weights=False)[0]
-        
-        # This part changes to handle the tuple
-        norm_output = self.layernorm(attn_output)
-        moe_output, moe_loss, moe_stats = self.mlp(norm_output) # self.mlp is now the MoE layer
-        
-        # Residual connection
-        final_output = attn_output + moe_output
-        
-        return final_output, moe_loss, moe_stats 
-
-    # Bind the new forward function to the instance of the model
-    attention_pooling_head.forward = types.MethodType(moe_forward, attention_pooling_head)
-    #print("Successfully patched the model's forward method.")
-    print("--- Model Surgery Complete ---")
-    
-    return attention_pooling_head
-
-
-
-def convert_pe_pooling_to_moe(attention_pooling_head, num_tasks: int, num_experts: int, top_k: int):
-    
-    Performs in-place modification of a pre-trained AttentionPooling instance,
-    replacing its MLP with a task-aware MoE layer and changing the number of probe queries to the number of task.
-    For Perception Encoder.
-    
-    
-    # --- 1. Save the pre-trained MLP weights BEFORE replacing the module ---
-    print("Saving pre-trained MLP weights...")
-    original_mlp_weights = attention_pooling_head.mlp.state_dict()
-    mlp_ratio = attention_pooling_head.mlp.c_fc.out_features // attention_pooling_head.embed_dim
-
-    # --- 2. Resize the probe for the desired number of tasks ---
-    print(f"Resizing attention probe from {attention_pooling_head.probe.shape[1]} to {num_tasks} tokens...")
-    # We can repeat the original probe to initialize the new ones, preserving knowledge
-    original_probe_data = attention_pooling_head.probe.data
-    new_probe_data = original_probe_data.repeat(1, num_tasks // original_probe_data.shape[1] + 1, 1)[:, :num_tasks, :]
-    attention_pooling_head.probe = nn.Parameter(new_probe_data)
-
-    # --- 3. Build the new MoE layer and seed its experts ---
-    print(f"Creating new MoE layer with {num_experts} experts...")
-    moe_layer = MoELayerTaskAware(
-        input_dim=attention_pooling_head.embed_dim,
-        hidden_dim=int(attention_pooling_head.embed_dim * mlp_ratio),
-        output_dim=attention_pooling_head.embed_dim,
-        num_experts=num_experts,
-        num_tasks=num_tasks,
-        top_k=top_k,
-        expert_class = ExpertPe
-    )
-
-    # Seed each expert with the pre-trained MLP weights
-    for i in range(num_experts):
-        moe_layer.experts[i].fc1.weight.data.copy_(original_mlp_weights['fc1.weight'])
-        moe_layer.experts[i].fc1.bias.data.copy_(original_mlp_weights['fc1.bias'])
-        moe_layer.experts[i].fc2.weight.data.copy_(original_mlp_weights['fc2.weight'])
-        moe_layer.experts[i].fc2.bias.data.copy_(original_mlp_weights['fc2.bias'])
-    print(f"All {num_experts} experts have been seeded.")
-
-
-    attention_pooling_head.mlp = moe_layer
-
-
-    # The original forward method needs to be replaced to handle the (output, loss) tuple.
-    def moe_forward(self, x: torch.Tensor):
-        batch, _, _ = x.shape
-        q = self.probe.repeat((batch, 1, 1))
-        # This part is the same
-        attn_output = self.attn(q, x, x, need_weights=False)[0]
-        
-        # This part changes to handle the tuple
-        norm_output = self.layernorm(attn_output)
-        moe_output, moe_loss, moe_stats = self.mlp(norm_output) # self.mlp is now the MoE layer
-        
-        # Residual connection
-        final_output = attn_output + moe_output
-        
-        return final_output, moe_loss, moe_stats 
-
-    # Bind the new forward function to the instance of the model
-    attention_pooling_head.forward = types.MethodType(moe_forward, attention_pooling_head)
-    #print("Successfully patched the model's forward method.")
-    print("--- Model Surgery Complete ---")
-    
-    return attention_pooling_head
-
-from transformers.models.siglip2.modeling_siglip2 import Siglip2MultiheadAttentionPoolingHead
-
-def convert_siglip_pooling_to_moe(
-    pooler: Siglip2MultiheadAttentionPoolingHead, 
-    num_tasks: int, 
-    num_experts: int, 
-    top_k: int
-):
-    
-    Performs in-place modification of a pre-trained Siglip2 pooling head,
-    replacing its MLP with a task-aware MoE layer.
-
-    Args:
-        pooler: An instance of the pre-trained Siglip2MultiheadAttentionPoolingHead.
-        num_tasks: The new number of task tokens you want to generate.
-        num_experts: The number of experts for the new MoE layer.
-        top_k: The number of experts to route to.
-
-    Returns:
-        The modified pooler instance.
-    
-    print("--- Starting Siglip2 Model Surgery ---")
-    
-    # Extract config from the old MLP
-    config = pooler.mlp.config
-    hidden_size = config.hidden_size
-    intermediate_size = config.intermediate_size
-
-    # 1. Save pre-trained MLP weights
-    print("Saving pre-trained SiglipMLP weights...")
-    original_mlp_weights = pooler.mlp.state_dict()
-
-    # 2. Resize the probe
-    print(f"Resizing attention probe from {pooler.probe.shape[1]} to {num_tasks} tokens...")
-    original_probe_data = pooler.probe.data
-    # Repeat the original probe to initialize the new ones
-    new_probe_data = original_probe_data.repeat(1, num_tasks, 1)
-    pooler.probe = nn.Parameter(new_probe_data)
-
-    # 3. Build the new MoE layer and seed its experts
-    print(f"Creating new MoE layer with {num_experts} experts...")
-
-    moe_layer = MoELayerTaskAware(
-        input_dim=hidden_size,
-        hidden_dim=intermediate_size,
-        output_dim=hidden_size,
-        num_experts=num_experts,
-        num_tasks=num_tasks,
-        top_k=top_k,
-        expert_class = ExpertSiglip
-    )
-
-    # Seed each expert with the pre-trained SiglipMLP weights
-    for i in range(num_experts):
-        moe_layer.experts[i].fc1.weight.data.copy_(original_mlp_weights['fc1.weight'])
-        moe_layer.experts[i].fc1.bias.data.copy_(original_mlp_weights['fc1.bias'])
-        moe_layer.experts[i].fc2.weight.data.copy_(original_mlp_weights['fc2.weight'])
-        moe_layer.experts[i].fc2.bias.data.copy_(original_mlp_weights['fc2.bias'])
-    print(f"All {num_experts} experts have been seeded.")
-
-    # 4. Replace the old MLP with the new MoE layer
-    pooler.mlp = moe_layer
-    print("Replaced original SiglipMLP with the new MoE layer.")
-
-    # 5. Monkey-patch the forward method
-    # Copied from the original source to ensure attention_mask logic is preserved
-    def moe_forward(self, hidden_state: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
-        batch_size = hidden_state.shape[0]
-        # The resized probe will now produce num_tasks tokens
-        probe = self.probe.repeat(batch_size, 1, 1)
-
-        # The original attention mask logic should be preserved as-is
-        if attention_mask is not None:
-            # This part of the code is specific to how Siglip handles masks
-            # and should not be changed.
-            target_len, source_len = probe.shape[1], hidden_state.shape[1]
-            # This helper function is likely defined within the transformers library
-            # If not, you may need to copy it. For now, assume it's accessible.
-            from transformers.models.siglip.modeling_siglip import _prepare_4d_attention_mask
-            attention_mask = _prepare_4d_attention_mask(attention_mask, hidden_state.dtype, target_len)
-            attention_mask = attention_mask.repeat(1, self.num_heads, target_len, 1)
-            attention_mask = attention_mask.reshape(-1, target_len, source_len)
-
-        # The output of attention now has shape (batch_size, num_tasks, hidden_size)
-        attn_output = self.attention(probe, hidden_state, hidden_state, attn_mask=attention_mask)[0]
-
-        # --- THIS IS THE MODIFIED PART ---
-        residual = attn_output
-        layernorm_output = self.layernorm(attn_output)
-        
-        # Unpack the tuple from our new MoE layer
-        moe_output, moe_loss, moe_stats = self.mlp(layernorm_output)
-        
-        hidden_state = residual + moe_output
-        
-        # CRUCIAL CHANGE: Return all task tokens, not just the first one.
-        # And also return the loss and stats.
-        return (hidden_state, moe_loss, moe_stats)
-
-    # Bind the new forward function to the instance of the pooler
-    pooler.forward = types.MethodType(moe_forward, pooler)
-    print("Successfully patched the pooler's forward method.")
-    print("--- Siglip2 Model Surgery Complete ---")
-    
-    return pooler
-
-
-"""

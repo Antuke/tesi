@@ -37,7 +37,7 @@ def get_backbone_pe(version, print_info=False):
     """
     Load PE ViT model, return model, transforms and size of output (dimension of embedding of last token)
     """
-    print(f'loading {version}...')
+    print(f'Loading {version}...')
     backbone = pe.VisionTransformer.from_config(version, pretrained=True)
     backbone_config = PE_VISION_CONFIG[version]
     transform = transforms_pe.get_image_transform_fix(image_size=backbone_config.image_size)

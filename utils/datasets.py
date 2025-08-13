@@ -137,28 +137,23 @@ class BaseDataset(Dataset, ABC):
         return len(self.active_df)
     
     def __getitem__(self, idx):
-        try:
-            if torch.is_tensor(idx):
-                idx = idx.tolist()
+        
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
             
             # Load image
-            relative_img_path = self.active_df.iloc[idx, PATH_COLUMN]
-            img_path = self.root_dir / relative_img_path
-            image = Image.open(img_path)
+        relative_img_path = self.active_df.iloc[idx, PATH_COLUMN]
+        img_path = self.root_dir / relative_img_path
+        image = Image.open(img_path)
             
-            # Get labels using abstract method
+        # Get labels using abstract method
             
-            labels = self.get_labels(idx)
-            #if self.return_path:
-            #     return self.transform(image), labels, img_path
+        labels = self.get_labels(idx)
+        if self.return_path:
+            return self.transform(image), labels, str(img_path)
 
-            return self.transform(image), labels
-        except Exception as e:
-            print(f"ERROR: Caught an exception in __getitem__ for index {idx}, path:")
-            print(f"Exception: {e}")
-            # Return a dummy sample of the correct size/type or raise the error
-            # Returning a dummy can help identify multiple bad files at once.
-            return torch.zeros_like(self.__getitem__(0)[0]), -1 # Example dummy
+        return self.transform(image), labels
+
     @abstractmethod
     def get_labels(self, idx):
         """Abstract method to extract labels from the dataframe."""
@@ -423,14 +418,15 @@ def get_loaders(full_dataset, generator, batch_size, split = [0.8,0.2]):
 import torchvision.transforms as transforms
 import math
 
+FIX = 0
 
-PATH_COLUMN = 0
-GENDER_COLUMN = 1
-AGE_COLUMN = 2
-EMOTION_COLUMN = 4
+PATH_COLUMN = 1 + FIX
+GENDER_COLUMN = 2 + FIX
+AGE_COLUMN = 3 + FIX 
+EMOTION_COLUMN = 5 + FIX
 
 class MTLDataset(Dataset):
-    def __init__(self, csv_path, transform , balance_on="Facial Emotion", augment=True, root_dir= "/user/asessa/dataset tesi/", balance=True):
+    def __init__(self, csv_path, transform , balance_on="Facial Emotion", augment=True, root_dir= "/user/asessa/dataset tesi/", balance=True, return_path=False):
         self.labels_df = pd.read_csv(csv_path)
         self.transform = transform 
         self.root_dir = root_dir
@@ -441,6 +437,9 @@ class MTLDataset(Dataset):
             ])
         if balance: 
             self._balance_dataset(column_name=balance_on)
+        self.return_path = return_path
+
+
 
     def _balance_dataset(self, column_name, target_percentage=0.33):
         """Duplicates samples with valid labels in the specified column to meet the target percentage."""
@@ -539,7 +538,8 @@ class MTLDataset(Dataset):
   
 
         labels = torch.tensor([int(age_label), int(gender_label), int(emotion_label)], dtype=torch.long)
-        
+        if self.return_path:
+            return self.transform(image), labels, str(img_path)
         return self.transform(image), labels
 
 if __name__ == '__main__':

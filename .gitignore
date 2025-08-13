@@ -13,3 +13,4 @@ loss.py
 *.jpg
 *experiments*/
 *.sh
+my_notebooks/

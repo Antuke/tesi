@@ -27,7 +27,8 @@ def main():
     parser.add_argument('--probe_type', type=str, default='linear', choices=['attention', 'linear'], help='Type of probing.')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size for training.')
     parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate for optimizer.')
-    
+    parser.add_argument('--test', type=bool, default=False, help='Skip to testing')
+
     args = parser.parse_args()
     #if args.version == 'PE-Core-T16-384':
     #    torch.multiprocessing.set_start_method('spawn', force=True)
@@ -37,7 +38,11 @@ def main():
         sys.exit(1)
 
     task_config = TASK_REGISTRY[args.task]
-    
+    if args.test:
+        print('only testing!')
+        trainer = Trainer(config=task_config, args=args)
+        trainer.test(ckpt_path='/user/asessa/tesi/probing/experiments/emotion_classification/Siglip2-base-patch16-224/ckpt_lp/lp_emotion_Siglip2-base-patch16-224_70.pt')
+        exit()
     try:
         trainer = Trainer(config=task_config, args=args)
         trainer.train()
