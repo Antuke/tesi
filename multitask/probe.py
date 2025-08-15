@@ -23,7 +23,7 @@ from core.vision_encoder import pe
 from utils.commons import *
 from multitask.wrappers import SigLIPKMoeHead, SigLIPKProbeHead, PEMoeViT
 
-DROPOUT_P = 0.3
+DROPOUT_P = 0.5
 DEVICE = 'cuda' 
 
 class BackboneType(Enum):
@@ -57,7 +57,13 @@ class BackboneStrategy(ABC):
     @abstractmethod
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Dict]]:
         pass
-
+    @abstractmethod
+    def get_last_shared_layer(self) -> nn.Module:
+        pass
+    
+    @abstractmethod
+    def unfreeze_and_get_new_params(self, num_layers_to_unfreeze : int):
+        pass
 
 class PEStrategy(BackboneStrategy):
     """Strategy for the PE (VisionTransformer) backbone."""
@@ -71,7 +77,7 @@ class PEStrategy(BackboneStrategy):
             param.requires_grad = True
         head_params.extend(attn_pool_params)
 
-        if self.backbone.proj:
+        if self.backbone.proj is not None:
             self.backbone.proj.requires_grad = True
             head_params.append(self.backbone.proj)
 
@@ -100,6 +106,96 @@ class PEStrategy(BackboneStrategy):
                 named_param_groups.append({'name': 'backbone', 'params': backbone_params})
                 print("Identified 'backbone' parameter group for PE.")
 
+        return named_param_groups
+
+    def unfreeze_and_get_new_params(self, target_num_unfrozen_layers: int):
+        """
+        Unfreezes additional layers and returns ONLY the newly unfrozen parameters.
+        This is intended to be used with optimizer.add_param_group().
+        """
+        # Check if we actually need to unfreeze anything new
+        if target_num_unfrozen_layers <= self.currently_unfrozen_layers:
+            print(f"Request to unfreeze {target_num_unfrozen_layers} layers, but {self.currently_unfrozen_layers} are already unfrozen. No new layers to unfreeze.")
+            return []
+
+        new_backbone_params = []
+        layers = self.backbone.transformer.resblocks
+        
+        # Determine the slice of layers to unfreeze
+        # Example: If 2 are unfrozen and target is 4, we need layers[-4:-2]
+        start_index = -target_num_unfrozen_layers
+        end_index = -self.currently_unfrozen_layers if self.currently_unfrozen_layers > 0 else None
+        
+        layers_to_unfreeze = layers[start_index:end_index]
+        
+        num_newly_unfrozen = len(layers_to_unfreeze)
+        print(f"Unfreezing {num_newly_unfrozen} new transformer blocks...")
+
+        for block in layers_to_unfreeze:
+            for param in block.parameters():
+                if not param.requires_grad: 
+                    param.requires_grad = True
+                    new_backbone_params.append(param)
+        
+        # Update the state
+        self.currently_unfrozen_layers = target_num_unfrozen_layers
+
+        if not new_backbone_params:
+            return []
+
+        # Return the new parameters in the required group format
+        return [{'name': 'backbone', 'params': new_backbone_params}]
+
+    # TODO TEST
+    def get_parameter_groups(self, num_layers_to_unfreeze: int):
+        """
+        Sets the initial state of trainable parameters and returns all of them
+        in groups. This is intended for the initial setup of the optimizer.
+        """
+        # This logic is almost identical to your original method
+        named_param_groups = []
+
+        # --- Head Parameters ---
+        head_params = []
+        # Always make attn_pool and proj trainable from the start
+        attn_pool_params = list(self.backbone.attn_pool.parameters())
+        for param in attn_pool_params:
+            param.requires_grad = True
+        head_params.extend(attn_pool_params)
+
+        if self.backbone.proj is not None:
+            # Assuming proj is a single parameter tensor, not a module
+            self.backbone.proj.requires_grad = True
+            head_params.append(self.backbone.proj)
+        
+        named_param_groups.append({'name': 'head', 'params': head_params})
+        print("Identified 'head' parameter group for initial setup.")
+
+        # --- Backbone Parameters ---
+        if num_layers_to_unfreeze > 0:
+            backbone_params = []
+            # Unfreeze post-layernorm
+            ln_post_params = list(self.backbone.ln_post.parameters())
+            for param in ln_post_params:
+                param.requires_grad = True
+            backbone_params.extend(ln_post_params)
+
+            # Unfreeze transformer blocks
+            layers = self.backbone.transformer.resblocks
+            num_to_unfreeze = min(len(layers), num_layers_to_unfreeze)
+            print(f"Initially unfreezing the last {num_to_unfreeze} PE transformer blocks.")
+            
+            for block in layers[-num_to_unfreeze:]:
+                for param in block.parameters():
+                    param.requires_grad = True
+                backbone_params.extend(list(block.parameters()))
+
+            if backbone_params:
+                named_param_groups.append({'name': 'backbone', 'params': backbone_params})
+                print("Identified 'backbone' parameter group for initial setup.")
+
+        
+        self.currently_unfrozen_layers = num_layers_to_unfreeze
         return named_param_groups
 
     def enable_moe(self, num_tasks: int, num_experts: int, top_k: int):
@@ -134,7 +230,8 @@ class PEStrategy(BackboneStrategy):
         else: 
             return output, None, None
 
-
+    def get_last_shared_layer(self):
+        return self.backbone.ln_post
 
 class SigLIPStrategy(BackboneStrategy):
     """Strategy for the SigLIP backbone."""
@@ -193,9 +290,14 @@ class SigLIPStrategy(BackboneStrategy):
         else: 
             return output, None, None
 
+    def get_last_shared_layer(self) -> nn.Module:
+        return self.backbone.post_layernorm
+    
+    
 def _get_classifier_head(in_dim: int, out_dim: int, dropout_p: float = 0.0) -> nn.Sequential:
     """Creates a classifier head with dropout and a linear layer."""
     return nn.Sequential(
+        nn.BatchNorm1d(in_dim), 
         nn.Dropout(p=dropout_p),
         nn.Linear(in_dim, out_dim)
     )
@@ -243,6 +345,9 @@ class MultiTaskProbe(nn.Module):
         self._setup_layers(num_layers_to_unfreeze, moe_num_experts, moe_top_k)
         # used for Uncertainty Weights
         self.log_var = nn.Parameter(torch.zeros(self.num_tasks))
+        
+        # used for gradNorm
+        self.loss_weights = nn.Parameter(torch.ones(self.num_tasks))
 
     def _setup_layers(self, num_layers_to_unfreeze: int, moe_num_experts: int, moe_top_k: int):
         """Freezes backbone and delegates setup to the selected strategy."""
@@ -286,7 +391,7 @@ class MultiTaskProbe(nn.Module):
         for task_name, head in self.heads.items():
              if ckpt_path := ckpt_paths.get(task_name):
                 try:
-                    state_dict = torch.load(ckpt_path, map_location=device)
+                    state_dict = torch.load(ckpt_path, map_location=device, weights_only=True)
                     model_state_dict = state_dict['model_state_dict']
                     new_state_dict = {}
                     for key, value in model_state_dict.items():
@@ -297,7 +402,7 @@ class MultiTaskProbe(nn.Module):
                             new_state_dict[key] = value
 
                     # The head is a Sequential(Dropout, Linear). We load into the Linear layer.
-                    head[1].load_state_dict(new_state_dict)
+                    head[2].load_state_dict(new_state_dict)
                     print(f"Successfully loaded weights for '{task_name}' head from {ckpt_path}")
                 except FileNotFoundError:
                     print(f"ERROR: Head checkpoint not found for '{task_name}' at '{ckpt_path}'.")
@@ -311,9 +416,11 @@ class MultiTaskProbe(nn.Module):
         try:
             # Filter for parameters that require gradients
             trainable_state_dict = {name: param for name, param in self.named_parameters() if param.requires_grad}
+            model_buffers = {name: buf for name, buf in self.named_buffers()}
+            state_to_save = {**trainable_state_dict, **model_buffers}
             checkpoint = {
                 'epoch': epoch,
-                'model_state_dict': trainable_state_dict,
+                'model_state_dict':  state_to_save,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict()
             }
@@ -322,12 +429,16 @@ class MultiTaskProbe(nn.Module):
         except Exception as e:
             print(f"Error saving multi-task checkpoint to {path}: {e}")
 
-    def load(self, path: str, optimizer: Optional[torch.optim.Optimizer] = None, scheduler: Optional[torch.optim.lr_scheduler] = None, device: str = 'cuda'):
+    def load(self, path: str, optimizer: Optional[torch.optim.Optimizer] = None, scheduler = None, device: str = 'cuda'):
         """Loads a multi-task checkpoint into the model and optimizer."""
         try:
-            checkpoint = torch.load(path, map_location=device)
+            checkpoint = torch.load(path, map_location=device, weights_only=True)
             # Use strict=False to only load parameters present in the checkpoint
             self.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            print("--- Layers found in checkpoint ---")
+            for layer_name in checkpoint['model_state_dict'].keys():
+                print(layer_name)
+            print("------------------------------------")
             if optimizer and 'optimizer_state_dict' in checkpoint:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             if scheduler and 'scheduler_state_dict' in checkpoint:

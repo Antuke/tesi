@@ -1,0 +1,17 @@
+
+--- Test Results ---
+Average Loss: 0.1068
+Average Accuracy: 78.21%
+
+Per-Task Losses:
+  - Age: 1.0312
+  - Gender: 0.1374
+  - Emotion: 0.6163
+
+Per-Task Accuracies:
+  - Age: 56.64%
+  - Gender: 95.31%
+  - Emotion: 82.68%
+  - Age: 85.37% @2
+  - Gender: 100.00% @2
+  - Emotion: 93.34% @2

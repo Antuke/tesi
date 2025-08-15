@@ -11,6 +11,7 @@ import sys
 from torch.optim import Optimizer
 import core.vision_encoder.pe as pe
 DROPOUT_P = 0.3
+
 class Probe(nn.Module):
     """
     A probe to attach to a backbone model.
@@ -20,6 +21,7 @@ class Probe(nn.Module):
 
         self.backbone = backbone
         self.linear = nn.Sequential(
+            # nn.BatchNorm1d(backbone_output_dim), 
             nn.Dropout(p=DROPOUT_P), 
             nn.Linear(backbone_output_dim, n_out_classes)
         )

@@ -1,4 +1,4 @@
-"""This files implements the MoELayerTaskAware module"""
+"""This files implements the MoELayerTaskAware module """
 
 
 import torch, sys, os
@@ -14,29 +14,8 @@ import core.vision_encoder.pe as pe
 
 
 
-class ExpertSiglip(nn.Module):
-    """Expert network. Same MLP architecture used in Siglip2 (base)"""
-    def __init__(self, input_dim=768, hidden_dim=3072, output_dim=768):
-        super().__init__()
-        self.activation_fn = nn.functional.gelu
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.fc1(hidden_states)
-        hidden_states = self.activation_fn(hidden_states,approximate="tanh")
-        hidden_states = self.fc2(hidden_states)
-        return hidden_states
 
-class ExpertPe(nn.Module):
-    """Expert network. Same MLP architecture used in Perception Encoders (base)"""
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super(ExpertPe, self).__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
-        self.gelu = nn.GELU()
-    def forward(self, x):
-        return self.fc2(self.gelu(self.fc1(x)))
 
 
 class TaskAwareGating(nn.Module):
@@ -58,7 +37,8 @@ class TaskAgnosticGating(nn.Module):
     
 class MoELayerTaskAware(nn.Module):
     """Shared Experts, individual gate. Each token received as input is assumed to be a task-embedding produces my the 
-    MHCA pooling layer with k-learnable queries, one per task. So each token is routed by an individual gate. """
+    MHCA pooling layer with k-learnable queries, one per task. So each token is routed by an individual gate.
+    If task-agnostic is set to true this acts as a normal mixture of expert layer."""
     def __init__(self, input_dim, hidden_dim, output_dim, num_experts, num_tasks, expert_class, top_k=2, task_agnostic_gate=False):
         super().__init__()
         self.num_experts = num_experts

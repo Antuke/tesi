@@ -20,6 +20,19 @@ from core.vision_encoder import pe
 
 
 # ------------- SIGLIP2 ------------- #
+class ExpertSiglip(nn.Module):
+    """Expert network. Same MLP architecture used in Siglip2 (base)"""
+    def __init__(self, input_dim=768, hidden_dim=3072, output_dim=768):
+        super().__init__()
+        self.activation_fn = nn.functional.gelu
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.fc1(hidden_states)
+        hidden_states = self.activation_fn(hidden_states,approximate="tanh")
+        hidden_states = self.fc2(hidden_states)
+        return hidden_states
 
 
 class SigLIPKProbeHead(nn.Module):
@@ -134,7 +147,16 @@ class SigLIPKMoeHead(nn.Module):
 
 
 # ------------- PERCEPTION ENCODERS ------------- #
-
+class ExpertPe(nn.Module):
+    """Expert network. Same MLP architecture used in Perception Encoders (base)"""
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(ExpertPe, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.gelu = nn.GELU()
+    def forward(self, x):
+        return self.fc2(self.gelu(self.fc1(x)))
+        
 
 class PEMoeViT(nn.Module):
     """
@@ -181,9 +203,9 @@ class PEMoeViT(nn.Module):
         ).to('cuda')
 
         # three distinct projection matrices
-        self.proj = nn.Parameter(
-            torch.stack([original_vit.proj.clone() for _ in range(num_tasks)], dim=0)
-        )
+        proj_tensor_replicated = original_vit.proj.unsqueeze(0).repeat(num_tasks, 1, 1)
+        proj_tensor_replicated = proj_tensor_replicated.clone().detach().to('cuda')
+        self.proj = nn.Parameter(proj_tensor_replicated, requires_grad=True)
         
         print("--- Wrapper Initialization Complete ---")
     
@@ -242,7 +264,7 @@ class PEMoeViT(nn.Module):
         # The projection layer is applied only to the final tensor output
         if self.proj is not None:
             # Einsum handles the projection on the last dimension of the multi-token output
-            x = torch.einsum('btd,dh->bth', x, self.proj)
+            x = torch.einsum('btd,tdh->bth', x, self.proj)
 
         return x, loss, gate_stats
 

@@ -1,10 +1,8 @@
 import argparse
 import os
 import sys
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any,  Dict, List, Tuple, Type
-import uuid
 
 import matplotlib.pyplot as plt
 import torch
@@ -27,13 +25,11 @@ from probing.probe import Probe
 from utils.commons import log_to_disk, get_backbone
 from utils.datasets import get_split, resample, MTLDataset
 from config.task_config import MTLConfig
-# from multitask.multitask_probe import MultiTaskProbe
 from multitask.probe import MultiTaskProbe
 
 
 
 
-# TODO Gradual unfreezing
 class Trainer:
     """
     Encapsulates the training, validation, and testing logic for a multi-task probe.
@@ -49,13 +45,12 @@ class Trainer:
         self.device = torch.device(config.device)
         self.scaler = torch.amp.GradScaler('cuda')
         self.version_name = 'Siglip2' if 'google' in args.version else args.version
-        self.saving_interval = 10
+        self.saving_interval = 15
         self.start_epoch = 0
         self.unfrozen_layers = 0 # besides attention pooling
         self.best_path=None
         self.ckpt_folder = 'ckpt'
         self.scheduler_type = 'lr_on_platue' # or cosine
-        # classic, k-probe, mhca-moe,
         self.probing_type = (
             'k-probe' if self.args.k_probes
             else 'mhca-moe' if self.args.moe
@@ -64,15 +59,30 @@ class Trainer:
         # lower lr for backboens
         self.lr_config = {
             'head': self.args.learning_rate,         
-            'backbone': self.args.learning_rate * 0.1  
+            'backbone': self.args.learning_rate * 0.3  
         }
         # at epoch key unfreeze the first value layers
         self.unfreeze_schedule = {
+            1 : 2, 
             2 : 2, 
-            4 : 2, 
-            6 : 3,
-            8 : 4
+            3 : 4,
+            4 : 5
         }
+
+        # dynamic unfreezing
+        self.unfreeze_on_plateau = False  
+        self.unfreeze_step = 2           
+        self.unfreeze_patience = 3       
+        self.max_unfrozen_layers = 9     
+
+        # State trackers for the dynamic strategy
+        self.plateau_counter = 0
+        self.best_accuracy_in_stage = -float('inf')
+
+        # grad norm parameters
+        self.use_grad_norm = config.use_grad_norm 
+        self.grad_norm_alpha = config.grad_norm_alpha 
+        self.initial_task_losses = None
 
         # These will be initialized in self.setup()
         self.mtl_probe = None
@@ -83,7 +93,11 @@ class Trainer:
         self.optimizer = None
         self.scheduler = None
         self.criterions = {}
-        self.setup()
+        if args.testing:
+            self._setup_model_and_optimizer()
+            self._setup_criterions({})
+        else:
+            self.setup()
         
     def setup(self):
         """Initializes all components required for training."""
@@ -92,28 +106,6 @@ class Trainer:
         class_weights = self._setup_loaders()
         self._setup_criterions(class_weights)
 
-    def unfreeze_layers(self, num_layers_to_unfreeze:int = None, k=1):
-        if num_layers_to_unfreeze:
-            named_groups = self.mtl_probe.unfreeze_layers(num_layers_to_unfreeze)
-            self.unfrozen_layers = num_layers_to_unfreeze
-        else:
-            named_groups = self.mtl_probe.unfreeze_layers(self.unfrozen_layers + k)
-            self.unfrozen_layers += k
-        
-        optimizer_param_groups = []
-        for group in named_groups:
-            group_name = group['name']
-            lr = self.lr_config[group_name]
-            optimizer_param_groups.append({
-                'params': group['params'],
-                'lr': lr
-            })
-        self.optimizer = optim.AdamW(optimizer_param_groups, fused=True)
-
-        if self.scheduler_type == 'cosine':
-            self.scheduler = CosineAnnealingWarmRestarts(self.optimizer, T_0=10, T_mult=2)
-        else:
-            self.scheduler = ReduceLROnPlateau(self.optimizer, factor = 0.5) # half learning rate on stagnation
 
     def _setup_model_and_optimizer(self):
         """Initializes the model, optimizer, and scheduler."""
@@ -129,16 +121,26 @@ class Trainer:
             use_moe=self.args.moe,
             use_k_probes=self.args.k_probes
         ).to(self.device)
-        self.mtl_probe = torch.compile(self.mtl_probe)
-        self.optimizer = optim.AdamW(
-            filter(lambda p: p.requires_grad, self.mtl_probe.parameters()),
-            lr=self.args.learning_rate,
-            fused=True
-        )
+
+        # self.mtl_probe = torch.compile(self.mtl_probe)
+
+        # grad norm requires that at least one other layer is unfrozen
+        initial_unfrozen_layers = 1 if self.use_grad_norm else 0
+        initial_param_groups = self.mtl_probe.strategy.get_parameter_groups(initial_unfrozen_layers)
+        self.unfrozen_layers = initial_unfrozen_layers
+        
+        optimizer_param_groups = []
+        for group in initial_param_groups:
+            group_name = group['name']
+            lr = self.lr_config.get(group_name, self.args.learning_rate)
+            optimizer_param_groups.append({'params': group['params'], 'lr': lr})
+
+        self.optimizer = optim.AdamW(optimizer_param_groups, lr=self.args.learning_rate, fused=True)
+
         if self.scheduler_type == 'cosine':
             self.scheduler = CosineAnnealingWarmRestarts(self.optimizer, T_0=10, T_mult=2)
         else:
-            self.scheduler = ReduceLROnPlateau(self.optimizer, factor = 0.5) # half learning rate on stagnation
+            self.scheduler = ReduceLROnPlateau(self.optimizer, factor = 0.5) # halve the learning rate on stagnation
 
 
         if self.args.resume_from_ckpt and os.path.exists(self.args.resume_from_ckpt):
@@ -146,6 +148,35 @@ class Trainer:
             self.start_epoch = self.mtl_probe.load(self.args.resume_from_ckpt, optimizer=self.optimizer, scheduler=self.scheduler)
         else:
             print("[TRAINER] Starting from scratch.")
+    
+    def unfreeze_layers(self, num_layers_to_unfreeze : int):
+        """Unfreeze more layers of the backbone """
+        new_param_groups = self.mtl_probe.strategy.unfreeze_and_get_new_params(num_layers_to_unfreeze)
+
+        if not new_param_groups:
+            print("[Optimizer] No new layers were unfrozen.")
+            return
+
+        # Add the new parameter groups to the existing optimizer
+        for group in new_param_groups:
+            group_name = group['name']
+            lr = self.lr_config.get(group_name, self.args.learning_rate * 0.3) # Default to backbone LR
+            
+            param_group_dict = {'params': group['params'], 'lr': lr}
+            
+            print(f"[Optimizer] Adding new parameter group '{group_name}' with LR: {lr}")
+            self.optimizer.add_param_group(param_group_dict)
+
+        print("[Optimizer] Successfully added new parameters to the existing optimizer.")
+
+        if isinstance(self.scheduler, ReduceLROnPlateau):
+            print("[Scheduler] Re-initializing ReduceLROnPlateau scheduler.")
+            self.scheduler = ReduceLROnPlateau(
+                self.optimizer, 
+                factor=0.5, 
+            )
+            
+
 
     def _setup_loaders(self) -> Dict[str, torch.Tensor]:
         """Initializes the dataloaders and returns class weights."""
@@ -169,12 +200,12 @@ class Trainer:
         self.train_loader = DataLoader(dataset_train, batch_size=self.args.batch_size, num_workers=self.config.num_workers, pin_memory=True, shuffle=True)
         if self.config.num_workers <= 2:
             print(f'[WARNING] THE NUMBER OF WORKERS IS ONLY {self.config.num_workers} THIS MAY RESULT IN A SLOW TRAINING')
-        self.val_loader = DataLoader(dataset_val, batch_size=self.args.batch_size, num_workers=self.config.num_workers, pin_memory=True)
+        self.val_loader = DataLoader(dataset_val, batch_size=self.args.batch_size, num_workers=self.config.num_workers, pin_memory=True, shuffle=False)
         
         return dataset_train.get_inverse_weights_loss()
 
 
-    def _setup_test_loader(self):
+    def _setup_test_loader(self, save_extreme_wrong=False):
         """Initializes the test dataloader when needed."""
         print("[TRAINER] Setting up test data loader...")
         dataset_test = MTLDataset(
@@ -183,7 +214,7 @@ class Trainer:
             augment=False,
             root_dir=self.config.dataset_root,
             balance=False,
-            return_path=True
+            return_path=save_extreme_wrong
         )
         self.test_loader = DataLoader(dataset_test, batch_size=self.args.batch_size, num_workers=self.config.num_workers, pin_memory=True)
 
@@ -196,29 +227,54 @@ class Trainer:
                 params['weight'] = class_weights[task.name].to(self.device)
                 print(f"[TRAINER] Using weighted loss for task: {task.name}")
             self.criterions[task.name] = task.criterion(**params)
-        
 
+    """ 
     def _get_save_path(self, epoch: int, is_head_only: bool = False) -> Path:
-        """Generates a consistent path for saving checkpoints."""
         task_name = f'mtl_{self.unfrozen_layers}'
         suffix = f"head+{str(epoch)}" if is_head_only else str(epoch)
         filename = f"{task_name}_{self.version_name}_{suffix}.pt"
         return self.config.output_folder / 'ckpt' / filename
-    
+    """
+    def eval_unfreeze_dynamic(self, val_accuracy):
+        """Evaluates if it's necessary to unfreeze more layers of the backbone, and does so if needed """
+        
+        if val_accuracy > self.best_accuracy_in_stage:
+            print(f"[Plateau Check] Validation accuracy improved to {val_accuracy:.4f}. Resetting counter.")
+            self.best_accuracy_in_stage = val_accuracy
+            self.plateau_counter = 0
+        else:
+            self.plateau_counter += 1
+            print(f"[Plateau Check] No improvement. Plateau counter is now {self.plateau_counter}/{self.unfreeze_patience}.")
+                    
+            if self.plateau_counter >= self.unfreeze_patience:
+                if self.unfrozen_layers < self.max_unfrozen_layers:
+                    print(f"[ACTION] Validation accuracy plateaued for {self.unfreeze_patience} epochs. Unfreezing {self.unfreeze_step} more layers.")
+                    
+                    self.unfreeze_layers(self.unfrozen_layers + self.unfreeze_step) 
+                    self.unfrozen_layers += self.unfreeze_step
+                    self.plateau_counter = 0
+                    self.best_accuracy_in_stage = -float('inf')
+                    print(f"[Dynamic Unfreezing] Now {self.unfrozen_layers} of the backbone are unfrozen.")
+                else:
+                    print("[Plateau Check] Max unfrozen layers reached. No more unfreezing.")
+                    self.unfreeze_on_plateau = False 
+
 
     def train(self):
         """Runs the main training loop."""
         print("\n--- Starting Training ---")
         self.config.output_folder.mkdir(parents=True, exist_ok=True)
         (self.config.output_folder / 'ckpt').mkdir(exist_ok=True)
+        (self.config.output_folder / 'confusion_matricies').mkdir(exist_ok=True)
         
         maximum_val_accuracy = -float('inf')
 
         for epoch in range(self.start_epoch, self.args.epochs):
             
-            if epoch in self.unfreeze_schedule:
+            if epoch in self.unfreeze_schedule and self.unfreeze_on_plateau == False:
                 print(f'[TRAINER] UNFREEZE OF LAYER {self.unfreeze_schedule[epoch]}')
                 self.unfreeze_layers(self.unfreeze_schedule[epoch])
+                self.unfrozen_layers = self.unfreeze_schedule[epoch]
 
 
             print(f"\nEpoch {epoch + 1}/{self.args.epochs}")
@@ -236,8 +292,15 @@ class Trainer:
                 self.save_confusion_matrix(cm, task_name, epoch+1)
             
             self._log_epoch_results(epoch, train_results, val_results)
+
             
             val_accuracy = val_results['avg_accuracy']
+
+            # dynamic un-freezing logic 
+            if self.unfreeze_on_plateau:
+                self.eval_unfreeze_dynamic(val_accuracy)
+
+            # saving logic (save each saving_interval, or save when avg_val_accuracy has reached a new height or save if its the last epoch)
             if (epoch + 1) % self.saving_interval == 0 or val_accuracy > maximum_val_accuracy or (epoch + 1) == self.args.epochs:
                 if val_accuracy > maximum_val_accuracy:
                     print(f"[TRAINER] New best validation accuracy: {val_accuracy:.5f}. Saving model.")
@@ -251,8 +314,8 @@ class Trainer:
                 self.mtl_probe.save(path=str(save_path), epoch=epoch + 1, optimizer=self.optimizer, scheduler=self.scheduler)
 
     def test(self, ckpt_path=None):
-        """Evaluates the model on the test set."""
-        self._setup_test_loader()
+        """Evaluates the model on the test set. Saves confusion matrices and generates a test_result.txt"""
+        self._setup_test_loader(save_extreme_wrong=False)
 
         if ckpt_path:
             self.mtl_probe.load(ckpt_path)
@@ -260,7 +323,7 @@ class Trainer:
             self.mtl_probe.load(self.best_path)
 
         print("\n--- Starting Testing ---")
-        test_results = self._run_epoch(self.test_loader, is_training=False, description="Testing",save_extreme_wrong=True)
+        test_results = self._run_epoch(self.test_loader, is_training=False, description="Testing",save_extreme_wrong=False)
         
         for task_name, cm in test_results['confusion_matrices'].items():
             self.save_confusion_matrix(cm, task_name, 0, is_final=True, accuracy=test_results['avg_accuracy'])
@@ -317,16 +380,65 @@ class Trainer:
                     images, labels, paths = batch
                 else:
                     images, labels = batch
-                with torch.autocast(device_type='cuda', dtype=torch.float16):
-                    loss, task_losses, task_outputs = self._process_batch(images, labels)
+                # grad norm is not compatible with autocasting, has they both "mess" with gradients 
+                with torch.autocast(device_type='cuda', dtype=torch.float16, enabled= not self.use_grad_norm):
+                    loss, task_losses, task_outputs, unweighted_task_losses  = self._process_batch(images, labels)
                 
                 if is_training:
                     self.optimizer.zero_grad()
-                    self.scaler.scale(loss).backward()
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    #loss.backward()
-                    #self.optimizer.step()
+
+                    if self.use_grad_norm:
+                        loss.backward(retain_graph=True)
+                        if self.initial_task_losses is None:
+                            self.initial_task_losses = [l.item() for l in unweighted_task_losses]
+                        
+                        last_shared_layer = self.mtl_probe.strategy.get_last_shared_layer()
+                        grad_norms = []
+
+                        for task_loss in unweighted_task_losses:
+                            grads = torch.autograd.grad(task_loss, last_shared_layer.parameters(), retain_graph=True, allow_unused=True)
+                            valid_grads = [g.view(-1) for g in grads if g is not None]
+                            if valid_grads:
+                                grad_norm = torch.norm(torch.cat(valid_grads)) # L2 norm as described in paper
+                                grad_norms.append(grad_norm)
+
+                        if not grad_norms: 
+                            self.optimizer.step()
+                            continue
+
+                        
+                        # Convert grad_norms list to a tensor
+                        stacked_grad_norms = torch.stack(grad_norms)
+
+                        # Calculate the weighted gradient norms. 
+                        # The GradNorm paper's loss is based on w_i * G_W(L_i)
+                        weighted_grad_norms = self.mtl_probe.loss_weights * stacked_grad_norms
+
+                        avg_grad_norm = torch.mean(weighted_grad_norms).detach()
+
+                        loss_ratios = [l.item() / initial_l for l, initial_l in zip(unweighted_task_losses, self.initial_task_losses)]
+                        avg_loss_ratio = sum(loss_ratios) / len(loss_ratios)
+                        relative_inverse_rates = [l / avg_loss_ratio for l in loss_ratios] # r_i (t) in the paper
+                        
+                        # Calculate the target gradient norms for each task
+                        target_grad_norms = torch.tensor([avg_grad_norm * (r ** self.grad_norm_alpha) for r in relative_inverse_rates], device=self.device)
+
+                        # The grad_norm_loss is the L1 distance between the current weighted norms and the targets.
+                        grad_norm_loss = torch.sum(torch.abs(weighted_grad_norms - target_grad_norms))
+
+
+                        self.mtl_probe.loss_weights.grad = torch.autograd.grad(grad_norm_loss, self.mtl_probe.loss_weights)[0]
+
+                        self.optimizer.step()
+
+                        with torch.no_grad():
+                            # normalization of the weights so they sum up to the number of tasks 
+                            self.mtl_probe.loss_weights.data = (self.mtl_probe.loss_weights.data / self.mtl_probe.loss_weights.data.sum()) * self.mtl_probe.num_tasks         
+                    else:
+                        self.scaler.scale(loss).backward()
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+
                     if isinstance(self.scheduler, CosineAnnealingWarmRestarts):
                         self.scheduler.step(epoch_idx + i / len(loader))
 
@@ -378,11 +490,12 @@ class Trainer:
                                 if abs(true_label - pred_label) > 3:
                                     output_dir = self.config.output_folder / f"extreme_wrong_classifications/true_{true_label}/pred_{pred_label}"
                                     output_dir.mkdir(parents=True, exist_ok=True)
-                                    #print('trovato uno')
                                     original_image_tensor = images[valid_mask][idx]
                                     img_path = Path(valid_paths[idx])
                                     save_image(original_image_tensor, output_dir / f"{img_path.stem}.png")
-                   
+                
+                  
+
         # Compile results
         results = {}
         results['avg_loss'] = total_loss / len(loader)
@@ -404,7 +517,7 @@ class Trainer:
         return results
     
     def _process_batch(self, images: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float], List[torch.Tensor]]:
-        """Processes a single batch of data, returning total loss, task losses, and outputs."""
+        """Processes a single batch of data, returning total loss weighted, unweighted task losses as a dictionary, model outputs and unweighted task_losses as a list"""
         images, labels = images.to(self.device), labels.to(self.device)
         
         # Forward pass
@@ -415,19 +528,20 @@ class Trainer:
 
         total_loss = 0.0
         task_losses = {}
-        
+        unweighted_task_losses = []
+
         for idx, task in enumerate(self.config.tasks):
             criterion = self.criterions[task.name]
             task_loss = criterion(task_outputs[idx], labels[:, idx])
             
-            # Store individual loss value, accounting for cases where no valid samples exist
             # to avoid to add nan to the batch loss
             if torch.isfinite(task_loss):
+                unweighted_task_losses.append(task_loss)
                 if self.config.use_uncertainty_weighting:
                     weighted_loss = 0.5 * torch.exp(-self.mtl_probe.log_var[idx]) * task_loss + 0.5 * self.mtl_probe.log_var[idx]
                     total_loss += weighted_loss
                 elif self.config.use_grad_norm:
-                    raise NotImplementedError("Grad norm has yet to be implemented")
+                    total_loss += self.mtl_probe.loss_weights[idx] * task_loss
                 else: # default static weight
                     total_loss += task_loss * task.weight 
 
@@ -437,7 +551,7 @@ class Trainer:
         # Add balancing loss for MoE models
         if self.args.moe:
             total_loss += 0.05 * bal_loss
-        return total_loss, task_losses, task_outputs
+        return total_loss, task_losses, task_outputs, unweighted_task_losses
 
     def _log_epoch_results(self, epoch_idx: int, train_results: Dict, val_results: Dict):
         """Logs the results of an epoch to a CSV file."""
@@ -518,106 +632,3 @@ class Trainer:
 
 
 
-
-if __name__ == '__main__':
-    from types import SimpleNamespace
-    import tempfile
-    def test_trainer_save_and_load():
-        """A standalone function to test the Trainer's save/load cycle."""
-        # Use a temporary directory that gets cleaned up automatically
-        with tempfile.TemporaryDirectory() as tempdir:
-            temp_path = Path(tempdir)
-            checkpoint_path = temp_path / "test_ckpt.pt"
-
-            # 1. ARRANGE (Setup First Trainer)
-            # ------------------------------------
-            print("--- Setting up Trainer 1 for saving ---")
-            
-            # Mock args and config
-            args1 = SimpleNamespace(
-                version='google/Siglip2-base-patch16-224',
-                ckpt_path=None,
-                learning_rate=0.01,
-                resume_from_ckpt=None, # Not resuming for the first trainer
-                moe=True,
-                batch_size=2, # Small batch size for the dummy step
-                epochs=10,
-            )
-            # Use a minimal version of your config
-            from config.task_config import MTL_TASK_CONFIG
-            config = MTL_TASK_CONFIG # Use your actual config object
-            config.output_folder = temp_path
-
-            # Create and setup the first trainer
-            trainer1 = Trainer(config=config, args=args1)
-            trainer1.setup()
-
-            # IMPORTANT: Run one dummy training step to initialize optimizer state
-            dummy_images = torch.randn(args1.batch_size, 3, 224, 224).to(trainer1.device)
-            dummy_labels = torch.randint(0, 2, (args1.batch_size, len(config.tasks))).to(trainer1.device)
-            
-            trainer1.optimizer.zero_grad()
-            loss, _, _ = trainer1._process_batch(dummy_images, dummy_labels)
-            loss.backward()
-            trainer1.optimizer.step()
-            trainer1.scheduler.step()
-
-            # 2. ACT (Save the Checkpoint)
-            # ------------------------------------
-            print(f"\n--- Saving checkpoint to {checkpoint_path} ---")
-            saving_epoch = 5
-            trainer1.mtl_probe.save(
-                path=checkpoint_path,
-                epoch=saving_epoch,
-                optimizer=trainer1.optimizer,
-                scheduler=trainer1.scheduler
-            )
-
-            # 3. ARRANGE (Setup Second Trainer for Loading)
-            # ------------------------------------
-            print("\n--- Setting up Trainer 2 for loading ---")
-            
-            # New args instance pointing to the checkpoint
-            args2 = SimpleNamespace(
-                version='google/Siglip2-base-patch16-224',
-                ckpt_path=None,
-                learning_rate=0.01,
-                resume_from_ckpt=str(checkpoint_path), # Point to the saved file
-                moe=True,
-                batch_size=2,
-                epochs=10
-            )
-
-            # Create a completely new trainer instance
-            trainer2 = Trainer(config=config, args=args2)
-            # The .setup() method contains the loading logic
-            trainer2.setup()
-
-            # 4. ASSERT (Verify the state was restored)
-            # ------------------------------------
-            print("\n--- Asserting restored state ---")
-
-            # Test 1: Start epoch is correct
-            assert trainer2.start_epoch == saving_epoch, f"Epoch mismatch: Expected {saving_epoch}, got {trainer2.start_epoch}"
-            print(f"[PASS] Start epoch correctly loaded as {trainer2.start_epoch}.")
-
-            # Test 2: Model weights are identical
-            for name, param1 in trainer1.mtl_probe.named_parameters():
-                if param1.requires_grad:
-                    print(f"Checking: {name:<50} ... ")
-                param2 = trainer2.mtl_probe.state_dict()[name]
-                assert torch.equal(param1, param2), f"Weight mismatch in parameter: {name}"
-            print("[PASS] Model weights are identical.")
-            
-            # Test 3: Optimizer state is restored (we'll check a key property)
-            # Note: Comparing dicts can be tricky. A good proxy is comparing a hyperparameter.
-            assert trainer1.optimizer.state_dict()['param_groups'][0]['lr'] == trainer2.optimizer.state_dict()['param_groups'][0]['lr'], "Optimizer LR mismatch"
-            print("[PASS] Optimizer learning rate is identical.")
-
-            # Test 4: Scheduler state is restored
-            assert trainer1.scheduler.state_dict() == trainer2.scheduler.state_dict(), "Scheduler state mismatch"
-            print("[PASS] Scheduler state is identical.")
-
-            print("\n✅ All tests passed!")
-
-    test_trainer_save_and_load()

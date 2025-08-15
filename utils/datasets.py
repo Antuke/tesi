@@ -418,7 +418,7 @@ def get_loaders(full_dataset, generator, batch_size, split = [0.8,0.2]):
 import torchvision.transforms as transforms
 import math
 
-FIX = 0
+FIX = -1
 
 PATH_COLUMN = 1 + FIX
 GENDER_COLUMN = 2 + FIX
@@ -433,6 +433,7 @@ class MTLDataset(Dataset):
         if augment: 
             self.transform = transforms.Compose([ 
                 transforms.RandomHorizontalFlip(), 
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
                 *transform.transforms 
             ])
         if balance: 

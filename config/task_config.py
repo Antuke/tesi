@@ -70,6 +70,7 @@ class MTLConfig:
     test_csv: Path
     use_grad_norm: bool
     use_uncertainty_weighting: bool
+    grad_norm_alpha : float
     
     # workers for dataloader
     num_workers: int = 8
@@ -101,20 +102,21 @@ MTL_TASK_CONFIG = MTLConfig(
         Task(name='Gender', class_labels=["Male", "Female"], criterion=nn.CrossEntropyLoss, weight=1.0),
         Task(name='Emotion', class_labels=["Surprise", "Fear", "Disgust", "Happy", "Sad", "Angry", "Neutral"], criterion=nn.CrossEntropyLoss, weight=1.0, use_weighted_loss=True)
     ],
-    output_folder=Path('./experiment'),
+    output_folder=Path('./PE_experiment1_good_dataset_pt_heads'),
     dataset_root=Path("/user/asessa/dataset tesi/"), 
-    train_csv=Path("/user/asessa/test_folder/train/train.csv"),
-    val_csv=Path("/user/asessa/test_folder/val/validation.csv"),
+    train_csv=Path("/user/asessa/dataset tesi/small_train.csv"),
+    val_csv=Path("/user/asessa/dataset tesi/mtl_test.csv"),
     test_csv=Path("/user/asessa/dataset tesi/mtl_test.csv"),
     use_uncertainty_weighting=True,
-    use_grad_norm=False
+    use_grad_norm=False,
+    grad_norm_alpha=0.25
 )
 
 """
 train_csv=Path("/user/asessa/test_folder/train/train.csv"),
 val_csv=Path("/user/asessa/test_folder/val/validation.csv"),
 test_csv=Path("/user/asessa/dataset tesi/mtl_test.csv"),
-
+/dataset tesi/datasets_with_standard_labels/VggFace2/test/labels_test_vgg_fixed.csv
 train_csv=/user/asessa/dataset tesi/small_train.csv
 test_csv=Path("/user/asessa/dataset_labels/test/emotion/raf-db.csv"),
 

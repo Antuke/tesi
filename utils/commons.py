@@ -1,15 +1,14 @@
 import sys
-
+import os
 from transformers import AutoModel, AutoProcessor 
-REPO_PATH = "C:/Users/antonio/Desktop/perception_models/"
-sys.path.append(REPO_PATH)
+from dotenv import load_dotenv
+load_dotenv()
+sys.path.append(os.getenv("REPO_PATH"))
 
 import os
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
 import core.vision_encoder.pe as pe
 import core.vision_encoder.transforms as transforms_pe
 from core.vision_encoder.config import PE_VISION_CONFIG, PEConfig, fetch_pe_checkpoint
@@ -23,7 +22,6 @@ from torch.optim.lr_scheduler import _LRScheduler
 import numpy as np
 
 import matplotlib.pyplot as plt
-import seaborn as sns
 
 def _get_backbone_pe(ckpt, version):
     backbone_config = PE_VISION_CONFIG[version]
@@ -47,6 +45,38 @@ def get_backbone_pe(version, print_info=False):
         print(f'embed_dim={attnpool.embed_dim}\nnum_heads={attnpool.num_heads}')
         print(f'OUTPUT DIM = {backbone_config.output_dim}')
     return backbone, transform, backbone_config.output_dim
+
+
+def get_backbone_dinov3(model_name: str="facebook/dinov3-vitb16-pretrain-lvd1689m", print_info=False):
+    print(f"Loading Hugging Face model: {model_name}")
+    processor = AutoProcessor.from_pretrained(model_name)
+    if print_info:
+        print(f'SIGLIP PROCESSOR:\n******************\n {processor.image_processor}\n******************\n')
+
+    # Extract image processing configuration from the loaded processor
+    image_processor_config = processor.image_processor
+    image_size = image_processor_config.size['height']
+    image_mean = image_processor_config.image_mean
+    image_std = image_processor_config.image_std
+
+    transform = transforms.Compose([
+        transforms.Lambda(_convert_to_rgb),
+        transforms.Resize((image_size, image_size), antialias=True),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=image_mean, std=image_std)
+    ])
+    
+    # Load the model and return only the vision backbone
+    model = AutoModel.from_pretrained(model_name)
+    vision_model = model.vision_model
+
+    if print_info:
+        print(f'\nVISION CONFIGS:\n{vision_model.config}')
+        print(f'\n\n***************MHAP\n{vision_model.head}')
+
+
+    return vision_model, transform, vision_model.config.hidden_size
+
 
 def get_backbone_siglip2(model_name: str='google/siglip2-base-patch16-224',print_info=False):
     """

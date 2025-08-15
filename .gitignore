@@ -14,3 +14,5 @@ loss.py
 *experiments*/
 *.sh
 my_notebooks/
+setup.py
+*experiment*
