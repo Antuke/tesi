@@ -84,13 +84,17 @@ class MultiTaskProbe(nn.Module):
             param.requires_grad = False
 
         if self.use_moe:
-            self.strategy.enable_moe(self.num_tasks,moe_num_experts, moe_top_k)
+            self.backbone = self.strategy.enable_moe(self.num_tasks,moe_num_experts, moe_top_k)
         elif self.use_k_probes:
-            self.strategy.enable_k_probes()
+            self.backbone = self.strategy.enable_k_probes()
             
         self.strategy.unfreeze_layers(num_layers_to_unfreeze)
 
-    def forward(self, x: torch.Tensor):
+    def get_last_shared_layer(self):
+        return self.strategy.get_last_shared_layer()
+
+
+    def forward(self, x: torch.Tensor, return_shared=False):
         """Forward pass through the model."""
         shared_features, balancing_loss, stats = self.strategy.forward(x)
 
@@ -108,12 +112,46 @@ class MultiTaskProbe(nn.Module):
                 for _, head in self.heads.items()
             ]
 
+        outputs_to_return = [logits]
+
+
         if self.use_moe:
-            return logits, balancing_loss, stats
-        return logits
+            outputs_to_return.append(balancing_loss)
+            outputs_to_return.append(stats)
+
+        if return_shared:
+            outputs_to_return.append(shared_features)    
+
+        if len(outputs_to_return) == 1:
+            return outputs_to_return[0]     
+        else:
+            return tuple(outputs_to_return)
 
     def unfreeze_layers(self, layers_to_unfreeze : int):
         return self.strategy.unfreeze_layers(layers_to_unfreeze)
+
+    def unfreeze_and_get_new_params(self, num_layers_to_unfreeze):
+        return self.strategy.unfreeze_and_get_new_params(num_layers_to_unfreeze)
+
+    def get_parameter_groups(self, initial_unfrozen_layers,using_uncertainty=False, using_grad_norm=False):
+        """Return initial parameter groups, so the attention pooling layer and the classification heads, plus
+        the loss weight parameters if need be"""
+        param_groups = self.strategy.get_parameter_groups(initial_unfrozen_layers)
+        param_groups.append({'name': 'heads', 'params': self.heads.parameters()})
+        
+        if using_grad_norm:
+            param_groups.append({
+                'name': 'heads',
+                'params': [self.loss_weights], 
+            })
+        if using_uncertainty:
+            param_groups.append({
+                'name': 'heads',
+                'params': [self.log_var], 
+            })
+
+        return param_groups
+
 
     def load_heads(self, ckpt_paths: Dict[str, str], device: str = 'cuda'):
         """Loads weights from checkpoints into the respective heads."""
@@ -143,10 +181,7 @@ class MultiTaskProbe(nn.Module):
     def save(self, path: str, epoch: int, optimizer: torch.optim.Optimizer, scheduler: torch.optim.lr_scheduler):
         """Saves a checkpoint with trainable weights and optimizer state."""
         try:
-            # Filter for parameters that require gradients
-            trainable_state_dict = {name: param for name, param in self.named_parameters() if param.requires_grad}
-            model_buffers = {name: buf for name, buf in self.named_buffers()}
-            state_to_save = {**trainable_state_dict, **model_buffers}
+
             checkpoint = {
                 'epoch': epoch,
                 'model_state_dict':  self.state_dict(),

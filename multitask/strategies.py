@@ -203,6 +203,7 @@ class PEStrategy(BackboneStrategy):
 
     def enable_moe(self, num_tasks: int, num_experts: int, top_k: int):
         self.backbone = PEMoeViT(self.backbone, num_tasks=num_tasks, num_experts=num_experts, top_k=top_k, task_agnostic_gate=self.task_agnostic_gate)
+        return self.backbone
 
     def enable_k_probes(self):
         original_probe = self.backbone.attn_pool.probe.data
@@ -221,6 +222,7 @@ class PEStrategy(BackboneStrategy):
             return x
 
         self.backbone.forward = types.MethodType(forward, self.backbone)
+        return self.backbone
 
     def get_probe(self) -> nn.Parameter:
         return self.backbone.attn_pool.probe.data
@@ -234,7 +236,7 @@ class PEStrategy(BackboneStrategy):
             return output, None, None
 
     def get_last_shared_layer(self):
-        return self.backbone.ln_post
+        return self.backbone.transformer.resblocks[-1].mlp.c_proj
 
 class SigLIPStrategy(BackboneStrategy):
     """Strategy for the SigLIP backbone."""
@@ -274,14 +276,15 @@ class SigLIPStrategy(BackboneStrategy):
 
     def enable_moe(self, num_tasks, num_experts: int, top_k: int):
         self.backbone.head = SigLIPKMoeHead(self.backbone.head, num_tasks=num_tasks, num_experts=num_experts, top_k=top_k, task_agnostic_gate=self.task_agnostic_gate)
-
+        return self.backbone
 
     def enable_k_probes(self):
         original_probe = self.backbone.head.probe.data
         new_probes = original_probe.repeat(1, self.num_tasks, 1)
         self.backbone.head.probe = nn.Parameter(new_probes)
         self.backbone.head = SigLIPKProbeHead(self.backbone.head)
-
+        return self.backbone
+        
     def get_probe(self) -> nn.Parameter:
         return self.backbone.head.probe.data
 
@@ -294,7 +297,7 @@ class SigLIPStrategy(BackboneStrategy):
             return output, None, None
 
     def get_last_shared_layer(self) -> nn.Module:
-        return self.backbone.post_layernorm
+        return self.backbone.encoder.layers[-1]
 
 
     def unfreeze_and_get_new_params(self, target_num_unfrozen_layers: int):

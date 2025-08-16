@@ -62,13 +62,13 @@ def main():
         Task(name='Gender', class_labels=["Male", "Female"], criterion=torch.nn.CrossEntropyLoss, weight=1.0),
         Task(name='Emotion', class_labels=["Surprise", "Fear", "Disgust", "Happy", "Sad", "Angry", "Neutral"], criterion=torch.nn.CrossEntropyLoss, weight=1.0, use_weighted_loss=True)
     ],
-        output_folder=Path('./experiment_grad_norm1'),
+        output_folder=Path('./pe_outputs_uncertainty_weighting'),
         dataset_root=Path("/user/asessa/dataset tesi/"), 
         train_csv=Path("/user/asessa/dataset tesi/small_train.csv"),
         val_csv=Path("/user/asessa/dataset tesi/mtl_test.csv"),
         test_csv=Path("/user/asessa/dataset tesi/mtl_test.csv"),
-        use_uncertainty_weighting=False,
-        use_grad_norm=True,
+        use_uncertainty_weighting=True,
+        use_grad_norm=False,
         grad_norm_alpha=1.5
     )
     if not torch.cuda.is_available():
@@ -80,8 +80,7 @@ def main():
     if args.testing:
         print('!!!TESTING!!!')
         trainer = Trainer(config=task_config, args=args)
-        # trainer.test(ckpt_path="/user/asessa/tesi/multitask/experiment1_small_dataset_pt_heads_batch_norm/ckpt/mtl_Siglip2_ul0_13.pt")
-        trainer.unfreeze_layers(8)
+        trainer.test(ckpt_path="/user/asessa/tesi/multitask/pe_outputs_uncertainty_weighting/ckpt/mtl_PE-Core-B16-224_ul0_1.pt")
         exit()
 
     try:

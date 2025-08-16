@@ -26,7 +26,7 @@ from utils.commons import log_to_disk, get_backbone
 from utils.datasets import get_split, resample, MTLDataset
 from config.task_config import MTLConfig
 from multitask.probe import MultiTaskProbe
-
+from gradnorm_pytorch import GradNormLossWeighter
 
 BACKBONE_LR_RATIO = 0.1
 
@@ -69,11 +69,13 @@ class Trainer:
             4 : 5
         }
 
+        self.use_uncertainty_weighting = config.use_uncertainty_weighting
+
         # dynamic unfreezing
         self.unfreeze_on_plateau = True  
         self.unfreeze_step = 1           
         self.unfreeze_patience = 2       
-        self.max_unfrozen_layers = 9     
+        self.max_unfrozen_layers = 4     
 
         # State trackers for the dynamic strategy
         self.plateau_counter = 0
@@ -126,9 +128,11 @@ class Trainer:
 
         # grad norm requires that at least one other layer is unfrozen
         initial_unfrozen_layers = 1 if self.use_grad_norm else 0
-        initial_param_groups = self.mtl_probe.strategy.get_parameter_groups(initial_unfrozen_layers)
+        initial_param_groups = self.mtl_probe.get_parameter_groups(initial_unfrozen_layers, 
+                                                                using_uncertainty=self.use_uncertainty_weighting,
+                                                                using_grad_norm=self.use_grad_norm)
         self.unfrozen_layers = initial_unfrozen_layers
-        
+
         optimizer_param_groups = []
         for group in initial_param_groups:
             group_name = group['name']
@@ -136,6 +140,15 @@ class Trainer:
             optimizer_param_groups.append({'params': group['params'], 'lr': lr})
 
         self.optimizer = optim.AdamW(optimizer_param_groups, lr=self.args.learning_rate, fused=True)
+        
+        if self.use_grad_norm:
+            self.loss_weighter = GradNormLossWeighter(
+                num_losses = 3,
+                learning_rate = 1e-4,
+                restoring_force_alpha = 0.,                
+                grad_norm_parameters =  None
+            )
+
 
         if self.scheduler_type == 'cosine':
             self.scheduler = CosineAnnealingWarmRestarts(self.optimizer, T_0=10, T_mult=2)
@@ -151,7 +164,7 @@ class Trainer:
     
     def unfreeze_layers(self, num_layers_to_unfreeze : int):
         """Unfreeze more layers of the backbone """
-        new_param_groups = self.mtl_probe.strategy.unfreeze_and_get_new_params(num_layers_to_unfreeze)
+        new_param_groups = self.mtl_probe.unfreeze_and_get_new_params(num_layers_to_unfreeze)
 
         if not new_param_groups:
             print("[Optimizer] No new layers were unfrozen.")
@@ -216,7 +229,8 @@ class Trainer:
             balance=False,
             return_path=save_extreme_wrong
         )
-        self.test_loader = DataLoader(dataset_test, batch_size=self.args.batch_size, num_workers=self.config.num_workers, pin_memory=True)
+
+        self.test_loader = DataLoader(dataset_test, batch_size=self.args.batch_size, num_workers=self.config.num_workers, pin_memory=True, shuffle=False)
 
     def _setup_criterions(self, class_weights: Dict[str, torch.Tensor]):
         """Initializes loss functions with optional class weighting."""
@@ -228,13 +242,7 @@ class Trainer:
                 print(f"[TRAINER] Using weighted loss for task: {task.name}")
             self.criterions[task.name] = task.criterion(**params)
 
-    """ 
-    def _get_save_path(self, epoch: int, is_head_only: bool = False) -> Path:
-        task_name = f'mtl_{self.unfrozen_layers}'
-        suffix = f"head+{str(epoch)}" if is_head_only else str(epoch)
-        filename = f"{task_name}_{self.version_name}_{suffix}.pt"
-        return self.config.output_folder / 'ckpt' / filename
-    """
+
     def eval_unfreeze_dynamic(self, val_accuracy):
         """Evaluates if it's necessary to unfreeze more layers of the backbone, and does so if needed """
         
@@ -265,9 +273,10 @@ class Trainer:
         print("\n--- Starting Training ---")
         self.config.output_folder.mkdir(parents=True, exist_ok=True)
         (self.config.output_folder / 'ckpt').mkdir(exist_ok=True)
-        (self.config.output_folder / 'confusion_matricies').mkdir(exist_ok=True)
-        
+        (self.config.output_folder / 'confusion_matrices').mkdir(exist_ok=True)
+        (self.config.output_folder / 'confusion_matrices_normalized').mkdir(exist_ok=True)
         maximum_val_accuracy = -float('inf')
+        maximum_val_age = -float('inf')
 
         for epoch in range(self.start_epoch, self.args.epochs):
             
@@ -291,10 +300,14 @@ class Trainer:
             for task_name, cm in val_results['confusion_matrices'].items():
                 self.save_confusion_matrix(cm, task_name, epoch+1)
             
+            for task_name, cm in val_results['confusion_matrices_normalized'].items():
+                self.save_confusion_matrix(cm, task_name, epoch+1, normalized=True)
+
             self._log_epoch_results(epoch, train_results, val_results)
 
             
             val_accuracy = val_results['avg_accuracy']
+            val_age = val_results['task_losses']['Age']
 
             # dynamic un-freezing logic 
             if self.unfreeze_on_plateau:
@@ -362,6 +375,7 @@ class Trainer:
         self.mtl_probe.train(is_training)
         
         total_loss = 0.0
+        total_bal_loss = 0.0
         task_loss_totals = {task.name: 0.0 for task in self.config.tasks}
         task_sample_counts = {task.name: 0 for task in self.config.tasks}
         
@@ -374,6 +388,7 @@ class Trainer:
         pbar = tqdm(enumerate(loader), total=len(loader), desc=description)
 
         context = torch.no_grad() if not is_training else torch.enable_grad()
+        # --------------- EPOCH --------------- #
         with context:
             for i, batch in pbar:
                 if save_extreme_wrong:
@@ -381,8 +396,10 @@ class Trainer:
                 else:
                     images, labels = batch
                 # grad norm is not compatible with autocasting, has they both "mess" with gradients 
+                # not self.use_grad_norm
                 with torch.autocast(device_type='cuda', dtype=torch.float16, enabled= not self.use_grad_norm):
-                    loss, task_losses, task_outputs, unweighted_task_losses  = self._process_batch(images, labels)
+                    loss, task_losses, task_outputs, unweighted_task_losses, bal_loss, losses  = self._process_batch(images, labels, self.use_grad_norm)
+                
                 
                 if is_training:
                     self.optimizer.zero_grad()
@@ -392,7 +409,7 @@ class Trainer:
                         if self.initial_task_losses is None:
                             self.initial_task_losses = [l.item() for l in unweighted_task_losses]
                         
-                        last_shared_layer = self.mtl_probe.strategy.get_last_shared_layer()
+                        last_shared_layer = self.mtl_probe.get_last_shared_layer()
                         grad_norms = []
 
                         for task_loss in unweighted_task_losses:
@@ -413,7 +430,6 @@ class Trainer:
                         # Calculate the weighted gradient norms. 
                         # The GradNorm paper's loss is based on w_i * G_W(L_i)
                         weighted_grad_norms = self.mtl_probe.loss_weights * stacked_grad_norms
-
                         avg_grad_norm = torch.mean(weighted_grad_norms).detach()
 
                         loss_ratios = [l.item() / initial_l for l, initial_l in zip(unweighted_task_losses, self.initial_task_losses)]
@@ -428,13 +444,18 @@ class Trainer:
 
 
                         self.mtl_probe.loss_weights.grad = torch.autograd.grad(grad_norm_loss, self.mtl_probe.loss_weights)[0]
-
+                        print(self.mtl_probe.loss_weights.data)
                         self.optimizer.step()
 
                         with torch.no_grad():
                             # normalization of the weights so they sum up to the number of tasks 
-                            self.mtl_probe.loss_weights.data = (self.mtl_probe.loss_weights.data / self.mtl_probe.loss_weights.data.sum()) * self.mtl_probe.num_tasks         
+                            self.mtl_probe.loss_weights.data = (self.mtl_probe.loss_weights.data / self.mtl_probe.loss_weights.data.sum()) * self.mtl_probe.num_tasks   
                     else:
+
+                        # self.loss_weighter.backward(losses, shared_features)
+                        # print(self.loss_weighter.loss_weights)
+                        # self.optimizer.step()
+                        # self.optimizer.zero_grad()
                         self.scaler.scale(loss).backward()
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
@@ -443,12 +464,13 @@ class Trainer:
                         self.scheduler.step(epoch_idx + i / len(loader))
 
                 total_loss += loss.item()
-                
+                total_bal_loss += bal_loss.item()
+
                 task_loss_str = ", ".join([f"{name}: {l:.4f}" for name, l in task_losses.items()])
                 pbar.set_description(f"{description} - Avg Loss: {total_loss / (i + 1):.4f} | Batch Losses: [{task_loss_str}]")
                 if is_training and self.scheduler:
                     pbar.set_postfix(lr=f"{self.scheduler.get_last_lr()[0]:.6f}")
-
+                
                 # Accumulate losses, predictions, and top-k counts
                 for idx, task in enumerate(self.config.tasks):
                     target = labels[:, idx]
@@ -493,7 +515,9 @@ class Trainer:
                                     original_image_tensor = images[valid_mask][idx]
                                     img_path = Path(valid_paths[idx])
                                     save_image(original_image_tensor, output_dir / f"{img_path.stem}.png")
+                # break
                 
+            # --------------- EPOCH --------------- #
                   
 
         # Compile results
@@ -502,10 +526,15 @@ class Trainer:
         results['task_losses'] = {name: total / task_sample_counts[name] if task_sample_counts[name] > 0 else 0 for name, total in task_loss_totals.items()}
         
         if not is_training:
+            results['bal_loss'] = total_bal_loss / len(loader)
             results['accuracies'] = {name: accuracy_score(all_true[name], all_preds[name]) * 100 for name in all_true if all_true[name]}
             results['avg_accuracy'] = sum(results['accuracies'].values()) / len(results['accuracies']) if results['accuracies'] else 0
             results['confusion_matrices'] = {
                 name: confusion_matrix(all_true[name], all_preds[name], labels=range(self.config.task_map[name].num_classes))
+                for name in all_true if all_true[name]
+            }
+            results['confusion_matrices_normalized']  = {
+                name: confusion_matrix(all_true[name], all_preds[name], labels=range(self.config.task_map[name].num_classes),normalize='true')
                 for name in all_true if all_true[name]
             }
             results['top_k_accuracies'] = {
@@ -516,7 +545,7 @@ class Trainer:
 
         return results
     
-    def _process_batch(self, images: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float], List[torch.Tensor]]:
+    def _process_batch(self, images: torch.Tensor, labels: torch.Tensor, use_grad_norm : bool) -> Tuple[torch.Tensor, Dict[str, float], List[torch.Tensor]]:
         """Processes a single batch of data, returning total loss weighted, unweighted task losses as a dictionary, model outputs and unweighted task_losses as a list"""
         images, labels = images.to(self.device), labels.to(self.device)
         
@@ -526,14 +555,16 @@ class Trainer:
         else:
             task_outputs, bal_loss = self.mtl_probe(images), 0
 
+        
         total_loss = 0.0
         task_losses = {}
+        losses = []
         unweighted_task_losses = []
 
         for idx, task in enumerate(self.config.tasks):
             criterion = self.criterions[task.name]
             task_loss = criterion(task_outputs[idx], labels[:, idx])
-            
+            losses.append(task_loss)
             # to avoid to add nan to the batch loss
             if torch.isfinite(task_loss):
                 unweighted_task_losses.append(task_loss)
@@ -551,12 +582,20 @@ class Trainer:
         # Add balancing loss for MoE models
         if self.args.moe:
             total_loss += 0.05 * bal_loss
-        return total_loss, task_losses, task_outputs, unweighted_task_losses
+        return total_loss, task_losses, task_outputs, unweighted_task_losses, bal_loss, losses
 
     def _log_epoch_results(self, epoch_idx: int, train_results: Dict, val_results: Dict):
         """Logs the results of an epoch to a CSV file."""
         lr = self.scheduler.get_last_lr()[0] if self.scheduler else self.args.learning_rate
-        
+        loss_weights_str = ""
+
+        if self.use_grad_norm:
+            weights_values = self.mtl_probe.loss_weights.detach().cpu().tolist()
+            loss_weights_str = ",".join([f"{w:.4f}" for w in weights_values])
+        if self.use_uncertainty_weighting:
+            weights_values = self.mtl_probe.log_var.detach().cpu().tolist()
+            loss_weights_str = ",".join([f"{w:.4f}" for w in weights_values])
+
         if train_results:
             log_items = [
                 epoch_idx + 1,
@@ -566,7 +605,9 @@ class Trainer:
                 *[f"{loss:.4f}" for loss in val_results['task_losses'].values()],
                 f"{val_results['avg_accuracy']:.3f}",
                 *[f"{acc:.3f}" for acc in val_results['accuracies'].values()],
-                f"{lr:.6f}", f"{self.unfrozen_layers}"
+                f"{lr:.6f}", f"{self.unfrozen_layers}",
+                loss_weights_str,
+                f"{val_results['bal_loss']:.4f}"
             ]
         else:
             log_items = [
@@ -574,7 +615,7 @@ class Trainer:
                 f"{val_results['avg_loss']:.4f}",
                 *[f"{loss:.4f}" for loss in val_results['task_losses'].values()],
                 f"{val_results['avg_accuracy']:.3f}",
-                *[f"{acc:.3f}" for acc in val_results['top_k_accuracies'].values()]
+                *[f"{acc:.3f}" for acc in val_results['top_k_accuracies'].values()],
                 *[f"{acc:.3f}" for acc in val_results['accuracies'].values()],
                 f"{lr:.6f}"
             ]
@@ -588,17 +629,20 @@ class Trainer:
             header=self.config.header
         )
 
-    def save_confusion_matrix(self, cm: np.ndarray, task_name: str, epoch:int,  is_final: bool = False, accuracy=None):
+    def save_confusion_matrix(self, cm: np.ndarray, task_name: str, epoch:int,  is_final: bool = False, accuracy=None, normalized=False):
         """Saves a confusion matrix plot to disk."""
         task = self.config.task_map[task_name]
         disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=task.class_labels)
         disp.plot()
+        if normalized:
+            disp.plot(values_format='.2f')
         
         suffix = '_test_set' if is_final else str(epoch)
         if accuracy:
             suffix = f'{suffix}_{accuracy:.2f}'
-        cm_path = self.config.output_folder / 'confusion_matricies' /f'cm_mtl_{self.probing_type}_{self.version_name}_{task_name}{suffix}.jpg'
-        
+        cm_path = self.config.output_folder / 'confusion_matrices' /f'cm_mtl_{self.probing_type}_{self.version_name}_{task_name}{suffix}.jpg'
+        if normalized:
+            cm_path = self.config.output_folder / 'confusion_matrices_normalized' /f'cm_mtl_{self.probing_type}_{self.version_name}_{task_name}{suffix}.jpg'
         plt.savefig(cm_path, bbox_inches='tight')
         plt.close() # Close the plot to free memory
         print(f"Confusion matrix for '{task_name}' saved to {cm_path}")
