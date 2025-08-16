@@ -28,7 +28,7 @@ from config.task_config import MTLConfig
 from multitask.probe import MultiTaskProbe
 
 
-
+BACKBONE_LR_RATIO = 0.1
 
 class Trainer:
     """
@@ -59,7 +59,7 @@ class Trainer:
         # lower lr for backboens
         self.lr_config = {
             'head': self.args.learning_rate,         
-            'backbone': self.args.learning_rate * 0.3  
+            'backbone': self.args.learning_rate * BACKBONE_LR_RATIO 
         }
         # at epoch key unfreeze the first value layers
         self.unfreeze_schedule = {
@@ -70,9 +70,9 @@ class Trainer:
         }
 
         # dynamic unfreezing
-        self.unfreeze_on_plateau = False  
-        self.unfreeze_step = 2           
-        self.unfreeze_patience = 3       
+        self.unfreeze_on_plateau = True  
+        self.unfreeze_step = 1           
+        self.unfreeze_patience = 2       
         self.max_unfrozen_layers = 9     
 
         # State trackers for the dynamic strategy
@@ -160,7 +160,7 @@ class Trainer:
         # Add the new parameter groups to the existing optimizer
         for group in new_param_groups:
             group_name = group['name']
-            lr = self.lr_config.get(group_name, self.args.learning_rate * 0.3) # Default to backbone LR
+            lr = self.lr_config.get(group_name, self.args.learning_rate * BACKBONE_LR_RATIO) # Default to backbone LR
             
             param_group_dict = {'params': group['params'], 'lr': lr}
             
@@ -566,7 +566,7 @@ class Trainer:
                 *[f"{loss:.4f}" for loss in val_results['task_losses'].values()],
                 f"{val_results['avg_accuracy']:.3f}",
                 *[f"{acc:.3f}" for acc in val_results['accuracies'].values()],
-                f"{lr:.6f}"
+                f"{lr:.6f}", f"{self.unfrozen_layers}"
             ]
         else:
             log_items = [

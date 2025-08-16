@@ -434,7 +434,10 @@ class MTLDataset(Dataset):
             self.transform = transforms.Compose([ 
                 transforms.RandomHorizontalFlip(), 
                 transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-                *transform.transforms 
+                transforms.RandomRotation(degrees=10),
+                transforms.RandomAffine(degrees=10, translate=(0.05, 0.05), scale=(0.9, 1.1)),
+                *transform.transforms,
+                transforms.RandomErasing(p=0.5, scale=(0.02, 0.2), ratio=(0.3, 3.3)) 
             ])
         if balance: 
             self._balance_dataset(column_name=balance_on)
