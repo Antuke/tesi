@@ -94,8 +94,11 @@ class MultiTaskProbe(nn.Module):
         return self.strategy.get_last_shared_layer()
 
 
-    def forward(self, x: torch.Tensor, return_shared=False):
-        """Forward pass through the model."""
+    def forward(self, x: torch.Tensor, return_shared: bool = False) -> dict:
+        """
+        Forward pass through the model.
+        Always returns a dictionary.
+        """
         shared_features, balancing_loss, stats = self.strategy.forward(x)
 
         # If using k-probes or MoE, we expect per-task embeddings
@@ -112,20 +115,18 @@ class MultiTaskProbe(nn.Module):
                 for _, head in self.heads.items()
             ]
 
-        outputs_to_return = [logits]
-
+        # --- output dictionary ---
+        outputs = {"logits": logits}
 
         if self.use_moe:
-            outputs_to_return.append(balancing_loss)
-            outputs_to_return.append(stats)
+            outputs["balancing_loss"] = balancing_loss
+            outputs["stats"] = stats
 
         if return_shared:
-            outputs_to_return.append(shared_features)    
-
-        if len(outputs_to_return) == 1:
-            return outputs_to_return[0]     
-        else:
-            return tuple(outputs_to_return)
+            outputs["shared_features"] = shared_features
+            
+        # No more complex logic, just return the dictionary
+        return outputs
 
     def unfreeze_layers(self, layers_to_unfreeze : int):
         return self.strategy.unfreeze_layers(layers_to_unfreeze)

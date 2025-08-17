@@ -62,9 +62,9 @@ def main():
         Task(name='Gender', class_labels=["Male", "Female"], criterion=torch.nn.CrossEntropyLoss, weight=1.0),
         Task(name='Emotion', class_labels=["Surprise", "Fear", "Disgust", "Happy", "Sad", "Angry", "Neutral"], criterion=torch.nn.CrossEntropyLoss, weight=1.0, use_weighted_loss=True)
     ],
-        output_folder=Path('./pe_outputs_uncertainty_weighting'),
+        output_folder=Path('./pe_outputs_uncertainty_weighting_big'),
         dataset_root=Path("/user/asessa/dataset tesi/"), 
-        train_csv=Path("/user/asessa/dataset tesi/small_train.csv"),
+        train_csv=Path("/user/asessa/test_folder/train/train.csv"),
         val_csv=Path("/user/asessa/dataset tesi/mtl_test.csv"),
         test_csv=Path("/user/asessa/dataset tesi/mtl_test.csv"),
         use_uncertainty_weighting=True,

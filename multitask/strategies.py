@@ -1,5 +1,6 @@
-"""This files contains the MultiTaskProbe class, that is configured to handle the three multi-task probing approach 
-that have been experimented in this project, using the Strategy and factory pattern."""
+"""This files contains the concrete strategies and factory for those strategies used by the MultiTaskProbe class
+"""
+
 
 import sys
 import os
@@ -155,7 +156,6 @@ class PEStrategy(BackboneStrategy):
         Sets the initial state of trainable parameters and returns all of them
         in groups. This is intended for the initial setup of the optimizer.
         """
-        # This logic is almost identical to your original method
         named_param_groups = []
 
         # --- Head Parameters ---
@@ -167,7 +167,6 @@ class PEStrategy(BackboneStrategy):
         head_params.extend(attn_pool_params)
 
         if self.backbone.proj is not None:
-            # Assuming proj is a single parameter tensor, not a module
             self.backbone.proj.requires_grad = True
             head_params.append(self.backbone.proj)
         

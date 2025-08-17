@@ -112,7 +112,7 @@ class MoELayerTaskAware(nn.Module):
 
         # task-aware gating
         gating_logits = self.gating(x) # [batch_size, num_task, num_experts]
-        aux_loss = 0.0
+        aux_loss = torch.tensor(0.0, device=x.device)
         gate_stats = {}
 
         
@@ -121,8 +121,8 @@ class MoELayerTaskAware(nn.Module):
         top_k_weights, top_k_indices = torch.topk(gating_logits, self.top_k, dim=-1)
         top_k_weights = F.softmax(top_k_weights, dim=-1)
 
-        if self.training:
-            aux_loss = self.compute_load_balance_loss(gating_logits)
+        
+        aux_loss = self.compute_load_balance_loss(gating_logits)
         if calculate_gate_stats:
             gate_stats = self.compute_gate_stats(top_k_indices)
 

@@ -1,3 +1,5 @@
+""" This files contains the Trainer class for multi-task learning """
+
 import argparse
 import os
 import sys
@@ -75,7 +77,7 @@ class Trainer:
         self.unfreeze_on_plateau = True  
         self.unfreeze_step = 1           
         self.unfreeze_patience = 2       
-        self.max_unfrozen_layers = 4     
+        self.max_unfrozen_layers = 6     
 
         # State trackers for the dynamic strategy
         self.plateau_counter = 0
@@ -124,7 +126,7 @@ class Trainer:
             use_k_probes=self.args.k_probes
         ).to(self.device)
 
-        # self.mtl_probe = torch.compile(self.mtl_probe)
+        self.mtl_probe = torch.compile(self.mtl_probe)
 
         # grad norm requires that at least one other layer is unfrozen
         initial_unfrozen_layers = 1 if self.use_grad_norm else 0
@@ -143,9 +145,9 @@ class Trainer:
         
         if self.use_grad_norm:
             self.loss_weighter = GradNormLossWeighter(
-                num_losses = 3,
+                num_losses = len(self.config.tasks),
                 learning_rate = 1e-4,
-                restoring_force_alpha = 0.,                
+                restoring_force_alpha = self.config.grad_norm_alpha,                
                 grad_norm_parameters =  None
             )
 
@@ -199,7 +201,8 @@ class Trainer:
             transform=self.transform,
             augment=True,
             root_dir=self.config.dataset_root,
-            balance=True
+            balance=True,
+            csv_has_index=True
         )
         
         dataset_val = MTLDataset(
@@ -368,9 +371,10 @@ class Trainer:
             description: A string for the progress bar.
             epoch_idx: The current epoch index, used for the learning rate scheduler.
             k: The value for top-k accuracy calculation.
+            save_extreme_wrong: If True, creates folder where it saves the misclassifed samples. (dataloader has to return also the path for this to work)
             
         Returns:
-            A dictionary containing metrics for the epoch, including top-k accuracy.
+            A dictionary containing metrics for the epoch
         """
         self.mtl_probe.train(is_training)
         
@@ -395,67 +399,20 @@ class Trainer:
                     images, labels, paths = batch
                 else:
                     images, labels = batch
+
                 # grad norm is not compatible with autocasting, has they both "mess" with gradients 
-                # not self.use_grad_norm
                 with torch.autocast(device_type='cuda', dtype=torch.float16, enabled= not self.use_grad_norm):
-                    loss, task_losses, task_outputs, unweighted_task_losses, bal_loss, losses  = self._process_batch(images, labels, self.use_grad_norm)
+                    loss, task_losses, task_outputs, bal_loss  = self._process_batch(images, labels, self.use_grad_norm)
                 
                 
                 if is_training:
                     self.optimizer.zero_grad()
 
                     if self.use_grad_norm:
-                        loss.backward(retain_graph=True)
-                        if self.initial_task_losses is None:
-                            self.initial_task_losses = [l.item() for l in unweighted_task_losses]
-                        
-                        last_shared_layer = self.mtl_probe.get_last_shared_layer()
-                        grad_norms = []
-
-                        for task_loss in unweighted_task_losses:
-                            grads = torch.autograd.grad(task_loss, last_shared_layer.parameters(), retain_graph=True, allow_unused=True)
-                            valid_grads = [g.view(-1) for g in grads if g is not None]
-                            if valid_grads:
-                                grad_norm = torch.norm(torch.cat(valid_grads)) # L2 norm as described in paper
-                                grad_norms.append(grad_norm)
-
-                        if not grad_norms: 
-                            self.optimizer.step()
-                            continue
-
-                        
-                        # Convert grad_norms list to a tensor
-                        stacked_grad_norms = torch.stack(grad_norms)
-
-                        # Calculate the weighted gradient norms. 
-                        # The GradNorm paper's loss is based on w_i * G_W(L_i)
-                        weighted_grad_norms = self.mtl_probe.loss_weights * stacked_grad_norms
-                        avg_grad_norm = torch.mean(weighted_grad_norms).detach()
-
-                        loss_ratios = [l.item() / initial_l for l, initial_l in zip(unweighted_task_losses, self.initial_task_losses)]
-                        avg_loss_ratio = sum(loss_ratios) / len(loss_ratios)
-                        relative_inverse_rates = [l / avg_loss_ratio for l in loss_ratios] # r_i (t) in the paper
-                        
-                        # Calculate the target gradient norms for each task
-                        target_grad_norms = torch.tensor([avg_grad_norm * (r ** self.grad_norm_alpha) for r in relative_inverse_rates], device=self.device)
-
-                        # The grad_norm_loss is the L1 distance between the current weighted norms and the targets.
-                        grad_norm_loss = torch.sum(torch.abs(weighted_grad_norms - target_grad_norms))
-
-
-                        self.mtl_probe.loss_weights.grad = torch.autograd.grad(grad_norm_loss, self.mtl_probe.loss_weights)[0]
-                        print(self.mtl_probe.loss_weights.data)
+                        self.loss_weighter.backward(losses, shared_features)
                         self.optimizer.step()
-
-                        with torch.no_grad():
-                            # normalization of the weights so they sum up to the number of tasks 
-                            self.mtl_probe.loss_weights.data = (self.mtl_probe.loss_weights.data / self.mtl_probe.loss_weights.data.sum()) * self.mtl_probe.num_tasks   
+                        self.optimizer.zero_grad()
                     else:
-
-                        # self.loss_weighter.backward(losses, shared_features)
-                        # print(self.loss_weighter.loss_weights)
-                        # self.optimizer.step()
-                        # self.optimizer.zero_grad()
                         self.scaler.scale(loss).backward()
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
@@ -464,7 +421,8 @@ class Trainer:
                         self.scheduler.step(epoch_idx + i / len(loader))
 
                 total_loss += loss.item()
-                total_bal_loss += bal_loss.item()
+                if bal_loss:
+                    total_bal_loss += bal_loss.item()
 
                 task_loss_str = ", ".join([f"{name}: {l:.4f}" for name, l in task_losses.items()])
                 pbar.set_description(f"{description} - Avg Loss: {total_loss / (i + 1):.4f} | Batch Losses: [{task_loss_str}]")
@@ -515,7 +473,7 @@ class Trainer:
                                     original_image_tensor = images[valid_mask][idx]
                                     img_path = Path(valid_paths[idx])
                                     save_image(original_image_tensor, output_dir / f"{img_path.stem}.png")
-                # break
+                #break
                 
             # --------------- EPOCH --------------- #
                   
@@ -546,33 +504,26 @@ class Trainer:
         return results
     
     def _process_batch(self, images: torch.Tensor, labels: torch.Tensor, use_grad_norm : bool) -> Tuple[torch.Tensor, Dict[str, float], List[torch.Tensor]]:
-        """Processes a single batch of data, returning total loss weighted, unweighted task losses as a dictionary, model outputs and unweighted task_losses as a list"""
+        """Processes a single batch of data, returning total loss weighted, unweighted task losses, model outputs (needed for gradnorm) and moe balance loss (None if not using moe)"""
         images, labels = images.to(self.device), labels.to(self.device)
-        
         # Forward pass
-        if self.args.moe:
-            task_outputs, bal_loss, _ = self.mtl_probe(images)
-        else:
-            task_outputs, bal_loss = self.mtl_probe(images), 0
+        model_output = self.mtl_probe(images, return_shared=self.use_grad_norm)
+        task_outputs = model_output["logits"]
+        bal_loss = model_output.get("balancing_loss")
 
-        
         total_loss = 0.0
         task_losses = {}
-        losses = []
         unweighted_task_losses = []
 
         for idx, task in enumerate(self.config.tasks):
             criterion = self.criterions[task.name]
             task_loss = criterion(task_outputs[idx], labels[:, idx])
-            losses.append(task_loss)
             # to avoid to add nan to the batch loss
             if torch.isfinite(task_loss):
                 unweighted_task_losses.append(task_loss)
                 if self.config.use_uncertainty_weighting:
                     weighted_loss = 0.5 * torch.exp(-self.mtl_probe.log_var[idx]) * task_loss + 0.5 * self.mtl_probe.log_var[idx]
                     total_loss += weighted_loss
-                elif self.config.use_grad_norm:
-                    total_loss += self.mtl_probe.loss_weights[idx] * task_loss
                 else: # default static weight
                     total_loss += task_loss * task.weight 
 
@@ -582,7 +533,8 @@ class Trainer:
         # Add balancing loss for MoE models
         if self.args.moe:
             total_loss += 0.05 * bal_loss
-        return total_loss, task_losses, task_outputs, unweighted_task_losses, bal_loss, losses
+            # total weighted loss, unweighted task losses, model outputs, balancing loss
+        return total_loss, task_losses, task_outputs, bal_loss
 
     def _log_epoch_results(self, epoch_idx: int, train_results: Dict, val_results: Dict):
         """Logs the results of an epoch to a CSV file."""
@@ -633,10 +585,10 @@ class Trainer:
         """Saves a confusion matrix plot to disk."""
         task = self.config.task_map[task_name]
         disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=task.class_labels)
-        disp.plot()
         if normalized:
             disp.plot(values_format='.2f')
-        
+        else:
+            disp.plot()
         suffix = '_test_set' if is_final else str(epoch)
         if accuracy:
             suffix = f'{suffix}_{accuracy:.2f}'
