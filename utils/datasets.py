@@ -418,7 +418,7 @@ def get_loaders(full_dataset, generator, batch_size, split = [0.8,0.2]):
 import torchvision.transforms as transforms
 import math
 
-FIX = -1
+FIX = 0
 
 PATH_COLUMN = 1 + FIX
 GENDER_COLUMN = 2 + FIX
@@ -426,7 +426,7 @@ AGE_COLUMN = 3 + FIX
 EMOTION_COLUMN = 5 + FIX
 
 class MTLDataset(Dataset):
-    def __init__(self, csv_path, transform , balance_on="Facial Emotion", augment=True, root_dir= "/user/asessa/dataset tesi/", balance=True, return_path=False):
+    def __init__(self, csv_path, transform , balance_on="Facial Emotion", augment=True, root_dir= "/user/asessa/dataset tesi/", balance=True, return_path=False, csv_has_index=False):
         self.labels_df = pd.read_csv(csv_path)
         self.transform = transform 
         self.root_dir = root_dir
@@ -442,7 +442,11 @@ class MTLDataset(Dataset):
         if balance: 
             self._balance_dataset(column_name=balance_on)
         self.return_path = return_path
-
+        
+        self.path_column = 1 if csv_has_index else 0
+        self.gender_column = 2 if csv_has_index else 1
+        self.age_column = 3 if csv_has_index else 2
+        self.emotion_column = 5 if csv_has_index else 4
 
 
     def _balance_dataset(self, column_name, target_percentage=0.33):
@@ -488,30 +492,30 @@ class MTLDataset(Dataset):
 
         weights = {}
         # --- Age weights ---
-        valid_age_labels = self.labels_df[self.labels_df.iloc[:, AGE_COLUMN] != MISSING_LABEL]
+        valid_age_labels = self.labels_df[self.labels_df.iloc[:, self.age_column] != MISSING_LABEL]
         total_valid_age = len(valid_age_labels)
         if total_valid_age > 0:
-            class_counts_age = valid_age_labels.iloc[:, AGE_COLUMN].value_counts()
+            class_counts_age = valid_age_labels.iloc[:, self.age_column].value_counts()
             weights_age = torch.zeros(len(age_id2label))
             for class_idx, count in class_counts_age.items():
                 weights_age[int(class_idx)] = total_valid_age / (len(age_id2label) * count)
             weights['Age'] = weights_age
 
         # --- Gender weights ---
-        valid_gender_labels = self.labels_df[self.labels_df.iloc[:, GENDER_COLUMN] != MISSING_LABEL]
+        valid_gender_labels = self.labels_df[self.labels_df.iloc[:, self.gender_column] != MISSING_LABEL]
         total_valid_gender = len(valid_gender_labels)
         if total_valid_gender > 0:
-            class_counts_gender = valid_gender_labels.iloc[:, GENDER_COLUMN].value_counts()
+            class_counts_gender = valid_gender_labels.iloc[:, self.gender_column].value_counts()
             weights_gender = torch.zeros(len(gender_id2label))
             for class_idx, count in class_counts_gender.items():
                 weights_gender[int(class_idx)] = total_valid_gender / (len(gender_id2label) * count)
             weights['Gender'] = weights_gender
 
         # --- Emotion weights ---
-        valid_emotion_labels = self.labels_df[self.labels_df.iloc[:, EMOTION_COLUMN] != MISSING_LABEL]
+        valid_emotion_labels = self.labels_df[self.labels_df.iloc[:, self.emotion_column] != MISSING_LABEL]
         total_valid_emotion = len(valid_emotion_labels)
         if total_valid_emotion > 0:
-            class_counts_emotion = valid_emotion_labels.iloc[:, EMOTION_COLUMN].value_counts()
+            class_counts_emotion = valid_emotion_labels.iloc[:, self.emotion_column].value_counts()
             weights_emotion = torch.zeros(len(emotion_id2label))
             for class_idx, count in class_counts_emotion.items():
                 weights_emotion[int(class_idx)] = total_valid_emotion / (len(emotion_id2label) * count)
@@ -530,14 +534,14 @@ class MTLDataset(Dataset):
             
         # Load image
         # Column 0 in the merged dataframe is 'Path'
-        relative_img_path = self.labels_df.iloc[idx, PATH_COLUMN]
+        relative_img_path = self.labels_df.iloc[idx, self.path_column]
 
         img_path = self.root_dir / relative_img_path
         image = Image.open(img_path)
 
-        age_label = self.labels_df.iloc[idx, AGE_COLUMN]
-        gender_label = self.labels_df.iloc[idx, GENDER_COLUMN]
-        emotion_label = self.labels_df.iloc[idx, EMOTION_COLUMN]
+        age_label = self.labels_df.iloc[idx, self.age_column]
+        gender_label = self.labels_df.iloc[idx, self.gender_column]
+        emotion_label = self.labels_df.iloc[idx, self.emotion_column]
 
   
 
