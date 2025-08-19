@@ -23,7 +23,6 @@ REPO_PATH = os.getenv("REPO_PATH")
 if REPO_PATH:
     sys.path.append(REPO_PATH)
 
-from probing.probe import Probe
 from utils.commons import log_to_disk, get_backbone
 from utils.datasets import get_split, resample, MTLDataset
 from config.task_config import MTLConfig
@@ -31,6 +30,7 @@ from multitask.probe import MultiTaskProbe
 from gradnorm_pytorch import GradNormLossWeighter
 
 BACKBONE_LR_RATIO = 0.1
+BAL_LOSS_WEIGHT = 0
 
 class Trainer:
     """
@@ -49,6 +49,7 @@ class Trainer:
         self.version_name = 'Siglip2' if 'google' in args.version else args.version
         self.saving_interval = 15
         self.start_epoch = 0
+        self.I = 0 # debugging purposes
         self.unfrozen_layers = 0 # besides attention pooling
         self.best_path=None
         self.ckpt_folder = 'ckpt'
@@ -60,15 +61,16 @@ class Trainer:
         )
         # lower lr for backboens
         self.lr_config = {
-            'head': self.args.learning_rate,         
+            'classification_heads': self.args.learning_rate, 
+            'attn_pool' : self.args.learning_rate,        
             'backbone': self.args.learning_rate * BACKBONE_LR_RATIO 
         }
         # at epoch key unfreeze the first value layers
         self.unfreeze_schedule = {
-            1 : 2, 
-            2 : 2, 
-            3 : 4,
-            4 : 5
+            1 : 0, 
+            2 : 1, 
+            3 : 2,
+            4 : 3
         }
 
         self.use_uncertainty_weighting = config.use_uncertainty_weighting
@@ -77,7 +79,7 @@ class Trainer:
         self.unfreeze_on_plateau = True  
         self.unfreeze_step = 1           
         self.unfreeze_patience = 2       
-        self.max_unfrozen_layers = 6     
+        self.max_unfrozen_layers = 12     
 
         # State trackers for the dynamic strategy
         self.plateau_counter = 0
@@ -123,13 +125,15 @@ class Trainer:
             backbone_output_dim=hidden_size,
             tasks=task_dims,
             use_moe=self.args.moe,
-            use_k_probes=self.args.k_probes
+            use_k_probes=self.args.k_probes,
+            uncertainty_weighting_for_bal = 0
         ).to(self.device)
 
-        self.mtl_probe = torch.compile(self.mtl_probe)
+        # self.mtl_probe = torch.compile(self.mtl_probe)
 
         # grad norm requires that at least one other layer is unfrozen
-        initial_unfrozen_layers = 1 if self.use_grad_norm else 0
+        initial_unfrozen_layers = self.args.initial_ul
+        
         initial_param_groups = self.mtl_probe.get_parameter_groups(initial_unfrozen_layers, 
                                                                 using_uncertainty=self.use_uncertainty_weighting,
                                                                 using_grad_norm=self.use_grad_norm)
@@ -138,7 +142,8 @@ class Trainer:
         optimizer_param_groups = []
         for group in initial_param_groups:
             group_name = group['name']
-            lr = self.lr_config.get(group_name, self.args.learning_rate)
+            print(f'[Optimizer] Adding to the optimizer the group {group_name}, with {sum(p.numel() for p in group['params'])} parameters')
+            lr = self.lr_config.get(group_name, self.args.learning_rate * BACKBONE_LR_RATIO)  # Default to backbone LR
             optimizer_param_groups.append({'params': group['params'], 'lr': lr})
 
         self.optimizer = optim.AdamW(optimizer_param_groups, lr=self.args.learning_rate, fused=True)
@@ -179,7 +184,7 @@ class Trainer:
             
             param_group_dict = {'params': group['params'], 'lr': lr}
             
-            print(f"[Optimizer] Adding new parameter group '{group_name}' with LR: {lr}")
+            print(f'Adding to the optimizer the group {group_name}, with {sum(p.numel() for p in group['params'])} parameters')
             self.optimizer.add_param_group(param_group_dict)
 
         print("[Optimizer] Successfully added new parameters to the existing optimizer.")
@@ -189,6 +194,13 @@ class Trainer:
             self.scheduler = ReduceLROnPlateau(
                 self.optimizer, 
                 factor=0.5, 
+            )
+        elif isinstance(self.scheduler, CosineAnnealingWarmRestarts):
+            print("[Scheduler] Re-initializing CosineAnnealingWarmRestarts scheduler.")
+            self.scheduler = CosineAnnealingWarmRestarts(
+                self.optimizer, 
+                T_0=10, 
+                T_mult=2
             )
             
 
@@ -202,7 +214,7 @@ class Trainer:
             augment=True,
             root_dir=self.config.dataset_root,
             balance=True,
-            csv_has_index=True
+            csv_has_index=False
         )
         
         dataset_val = MTLDataset(
@@ -289,13 +301,14 @@ class Trainer:
                 self.unfrozen_layers = self.unfreeze_schedule[epoch]
 
 
-            print(f"\nEpoch {epoch + 1}/{self.args.epochs}")
+            print(f"\n[TRAINING] Epoch {epoch + 1}/{self.args.epochs}")
             
             train_results = self._run_epoch(self.train_loader, is_training=True, epoch_idx=epoch)
-            print(f"TRAINING Avg Loss: {train_results['avg_loss']:.4f}, Task Losses: {train_results['task_losses']}")
+            #   self.mtl_probe.print_requires_grad()  # Debugging: print requires_grad status
+            print(f"[LOGGING] TRAINING Avg Loss: {train_results['avg_loss']:.4f}, Task Losses: {train_results['task_losses']}")
             
             val_results = self._run_epoch(self.val_loader, is_training=False, description="Validating")
-            print(f"VALIDATION Avg Loss: {val_results['avg_loss']:.4f}, Task Accuracies: {val_results['accuracies']}")
+            print(f"[LOGGING] VALIDATION Avg Loss: {val_results['avg_loss']:.4f}, Task Accuracies: {val_results['accuracies']}")
             
             if isinstance(self.scheduler, ReduceLROnPlateau):
                 self.scheduler.step(val_results['avg_loss'])
@@ -402,13 +415,14 @@ class Trainer:
 
                 # grad norm is not compatible with autocasting, has they both "mess" with gradients 
                 with torch.autocast(device_type='cuda', dtype=torch.float16, enabled= not self.use_grad_norm):
-                    loss, task_losses, task_outputs, bal_loss  = self._process_batch(images, labels, self.use_grad_norm)
+                    loss, task_losses, task_outputs, bal_loss, shared_features  = self._process_batch(images, labels, self.use_grad_norm)
                 
                 
                 if is_training:
                     self.optimizer.zero_grad()
 
                     if self.use_grad_norm:
+                        losses = list(task_losses.values())
                         self.loss_weighter.backward(losses, shared_features)
                         self.optimizer.step()
                         self.optimizer.zero_grad()
@@ -417,7 +431,7 @@ class Trainer:
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
 
-                    if isinstance(self.scheduler, CosineAnnealingWarmRestarts):
+                    if self.scheduler_type == 'cosine':
                         self.scheduler.step(epoch_idx + i / len(loader))
 
                 total_loss += loss.item()
@@ -473,9 +487,9 @@ class Trainer:
                                     original_image_tensor = images[valid_mask][idx]
                                     img_path = Path(valid_paths[idx])
                                     save_image(original_image_tensor, output_dir / f"{img_path.stem}.png")
-                #break
                 
-            # --------------- EPOCH --------------- #
+                
+        # --------------- EPOCH --------------- #
                   
 
         # Compile results
@@ -510,6 +524,7 @@ class Trainer:
         model_output = self.mtl_probe(images, return_shared=self.use_grad_norm)
         task_outputs = model_output["logits"]
         bal_loss = model_output.get("balancing_loss")
+        shared_features = model_output.get("shared_features", None)
 
         total_loss = 0.0
         task_losses = {}
@@ -521,7 +536,7 @@ class Trainer:
             # to avoid to add nan to the batch loss
             if torch.isfinite(task_loss):
                 unweighted_task_losses.append(task_loss)
-                if self.config.use_uncertainty_weighting:
+                if self.config.use_uncertainty_weighting and self.unfrozen_layers >= 0:
                     weighted_loss = 0.5 * torch.exp(-self.mtl_probe.log_var[idx]) * task_loss + 0.5 * self.mtl_probe.log_var[idx]
                     total_loss += weighted_loss
                 else: # default static weight
@@ -532,9 +547,12 @@ class Trainer:
 
         # Add balancing loss for MoE models
         if self.args.moe:
-            total_loss += 0.05 * bal_loss
-            # total weighted loss, unweighted task losses, model outputs, balancing loss
-        return total_loss, task_losses, task_outputs, bal_loss
+            if BAL_LOSS_WEIGHT == 0:
+                total_loss += 0.5 * torch.exp(-self.mtl_probe.log_var[-1]) * bal_loss + 0.5 * self.mtl_probe.log_var[-1]
+            else:
+                total_loss += BAL_LOSS_WEIGHT * bal_loss
+                # total weighted loss, unweighted task losses, model outputs, balancing loss, shared features (backbone output)
+        return total_loss, task_losses, task_outputs, bal_loss, shared_features
 
     def _log_epoch_results(self, epoch_idx: int, train_results: Dict, val_results: Dict):
         """Logs the results of an epoch to a CSV file."""
@@ -597,7 +615,7 @@ class Trainer:
             cm_path = self.config.output_folder / 'confusion_matrices_normalized' /f'cm_mtl_{self.probing_type}_{self.version_name}_{task_name}{suffix}.jpg'
         plt.savefig(cm_path, bbox_inches='tight')
         plt.close() # Close the plot to free memory
-        print(f"Confusion matrix for '{task_name}' saved to {cm_path}")
+        print(f"[SAVING] Confusion matrix for '{task_name}' saved to {cm_path}")
 
     def load_heads(self, ckpt_paths):
         print('[TRAINER] Loading pre-trained heads...')

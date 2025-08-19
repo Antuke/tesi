@@ -14,6 +14,7 @@ from config.task_config import Task, MTLConfig
 
 # 'google/Siglip2-base-patch16-224'
 # 'PE-Core-B16-224'
+# 'PE-Core-T16-384' 
 
 def main():
     parser = argparse.ArgumentParser(description="Train and validate attention probes for different tasks.")
@@ -31,8 +32,11 @@ def main():
     parser.add_argument('--moe', type=bool, default=True, help='Use task-aware mixture of experts.')
     parser.add_argument('--k_probes', type=bool, default=False, help='Use k-task specific probes to produce three distinct task-embeddings for each classifier head')
     parser.add_argument('--testing', type=bool, default=False, help='Skip straight to testing')
+    parser.add_argument('--load_pt', type=bool, default=False, help='Load pre-trained heads from .pt files')
+    parser.add_argument('--initial_ul' , type=int, default=-1, help='How many layers to unfreeze at the start of training. If 0, only attn_pool layer is unfrozen. If -1 only the heads are trained (no mt learning)')
     args = parser.parse_args()
-    
+    print('Start training with the following args:')
+    print(args)
     pre_traiend_heads_siglip = {
         'age' : '/user/asessa/tesi/probing/experiments/age_classification/Siglip2-base-patch16-224/ckpt_lp/lp_age_Siglip2-base-patch16-224_47.pt',
         'gender' : '/user/asessa/tesi/probing/experiments/gender_classification/Siglip2-base-patch16-224/ckpt_lp/lp_gender_Siglip2-base-patch16-224_2.pt',
@@ -62,9 +66,9 @@ def main():
         Task(name='Gender', class_labels=["Male", "Female"], criterion=torch.nn.CrossEntropyLoss, weight=1.0),
         Task(name='Emotion', class_labels=["Surprise", "Fear", "Disgust", "Happy", "Sad", "Angry", "Neutral"], criterion=torch.nn.CrossEntropyLoss, weight=1.0, use_weighted_loss=True)
     ],
-        output_folder=Path('./pe_outputs_uncertainty_weighting_big'),
+        output_folder=Path('./outputs_pe_no_pt'),
         dataset_root=Path("/user/asessa/dataset tesi/"), 
-        train_csv=Path("/user/asessa/test_folder/train/train.csv"),
+        train_csv=Path("/user/asessa/dataset tesi/small_train.csv"),
         val_csv=Path("/user/asessa/dataset tesi/mtl_test.csv"),
         test_csv=Path("/user/asessa/dataset tesi/mtl_test.csv"),
         use_uncertainty_weighting=True,
@@ -78,20 +82,17 @@ def main():
     task_config = MTL_TASK_CONFIG
     
     if args.testing:
-        print('!!!TESTING!!!')
         trainer = Trainer(config=task_config, args=args)
-        trainer.test(ckpt_path="/user/asessa/tesi/multitask/pe_outputs_uncertainty_weighting/ckpt/mtl_PE-Core-B16-224_ul0_1.pt")
+        trainer.test(ckpt_path=args.resume_from_ckpt)
         exit()
 
     try:
-        #trainer = Trainer(config=task_config, args=args)
-        #trainer.load_heads(pre_traiend_heads)
-        #trainer.train()
         trainer = Trainer(config=task_config, args=args)
-        if 'google' in args.version:
-            trainer.load_heads(pre_traiend_heads_siglip)
-        else:
-            trainer.load_heads(pre_trained_head_pe)
+        if args.load_pt:
+            if 'google' in args.version:
+                trainer.load_heads(pre_traiend_heads_siglip)
+            else:
+                trainer.load_heads(pre_trained_head_pe)
         trainer.train()
         trainer.test()
     finally:

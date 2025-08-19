@@ -49,19 +49,19 @@ class MultiTaskProbe(nn.Module):
                  backbone: nn.Module,
                  backbone_output_dim: int,
                  tasks: Dict[str, int], 
-                 num_layers_to_unfreeze: int = 0,
+                 num_layers_to_unfreeze: int = -1,
                  use_k_probes: bool = False,
                  use_moe: bool = False,
                  moe_num_experts: int = 8,
                  moe_top_k: int = 2,
-                 task_agnostic_gate: bool = False):
+                 task_agnostic_gate: bool = False,
+                 uncertainty_weighting_for_bal : int = 0):
 
         super().__init__()
         
         if use_k_probes and use_moe:
             raise ValueError("use_k_probes and use_moe cannot be True at the same time.")
 
-        self.backbone = backbone
         self.tasks = tasks
         self.num_tasks = len(tasks)
         self.use_k_probes = use_k_probes
@@ -70,25 +70,23 @@ class MultiTaskProbe(nn.Module):
             task_name: _get_classifier_head(backbone_output_dim, out_dim, DROPOUT_P)
             for task_name, out_dim in self.tasks.items()
         })
-        self.strategy = backbone_strategy_factory(self.backbone, self.num_tasks, task_agnostic_gate)      
+        self.strategy = backbone_strategy_factory(backbone, self.num_tasks, task_agnostic_gate)      
         self._setup_layers(num_layers_to_unfreeze, moe_num_experts, moe_top_k)
-        # used for Uncertainty Weights
-        self.log_var = nn.Parameter(torch.zeros(self.num_tasks))
+        # used for Uncertainty Weights (if uncertainty_weighting_for_bal is more than 0, it will also weight that additional loss)
+        self.log_var = nn.Parameter(torch.zeros(self.num_tasks + uncertainty_weighting_for_bal))
         
-        # used for gradNorm
-        self.loss_weights = nn.Parameter(torch.ones(self.num_tasks))
+        # was used for gradNorm, now using gradnorm-pytorch module
+        # self.loss_weights = nn.Parameter(torch.ones(self.num_tasks))
 
     def _setup_layers(self, num_layers_to_unfreeze: int, moe_num_experts: int, moe_top_k: int):
         """Freezes backbone and delegates setup to the selected strategy."""
-        for param in self.backbone.parameters():
-            param.requires_grad = False
 
         if self.use_moe:
-            self.backbone = self.strategy.enable_moe(self.num_tasks,moe_num_experts, moe_top_k)
+            self.strategy.enable_moe(self.num_tasks,moe_num_experts, moe_top_k)
         elif self.use_k_probes:
-            self.backbone = self.strategy.enable_k_probes()
+            self.strategy.enable_k_probes()
             
-        self.strategy.unfreeze_layers(num_layers_to_unfreeze)
+        self.strategy.setup_layers(num_layers_to_unfreeze)
 
     def get_last_shared_layer(self):
         return self.strategy.get_last_shared_layer()
@@ -133,23 +131,31 @@ class MultiTaskProbe(nn.Module):
 
     def unfreeze_and_get_new_params(self, num_layers_to_unfreeze):
         return self.strategy.unfreeze_and_get_new_params(num_layers_to_unfreeze)
+    
+    def print_requires_grad(self):
+        """Prints the requires_grad status of all parameters in the model."""
+        for name, param in self.named_parameters():
+            print(f"{name}: {param.requires_grad}")
 
-    def get_parameter_groups(self, initial_unfrozen_layers,using_uncertainty=False, using_grad_norm=False):
-        """Return initial parameter groups, so the attention pooling layer and the classification heads, plus
-        the loss weight parameters if need be"""
+    def get_parameter_groups(self, initial_unfrozen_layers, using_uncertainty=False, using_grad_norm=False):
+        """Return initial parameter groups..."""
         param_groups = self.strategy.get_parameter_groups(initial_unfrozen_layers)
-        param_groups.append({'name': 'heads', 'params': self.heads.parameters()})
-        
+
+        # --- Unfreeze head parameters here, as this is part of the model's state setup ---
+        for param in self.heads.parameters():
+            param.requires_grad = True
+
+        # --- Create a single group for all head-related parameters ---
+        head_params = list(self.heads.parameters())
+
         if using_grad_norm:
-            param_groups.append({
-                'name': 'heads',
-                'params': [self.loss_weights], 
-            })
+            pass 
+            
         if using_uncertainty:
-            param_groups.append({
-                'name': 'heads',
-                'params': [self.log_var], 
-            })
+            self.log_var.requires_grad = True
+            head_params.append(self.log_var)
+
+        param_groups.append({'name': 'classification_heads', 'params': head_params})
 
         return param_groups
 
