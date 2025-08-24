@@ -41,12 +41,14 @@ class SigLIPKProbeHead(nn.Module):
     """
     def __init__(self, original_head: Siglip2MultiheadAttentionPoolingHead):
         super().__init__()
+        print("[WRAPPER] Substituing the Attention pooling head of SigLip2 with k-probes")
         # Copy necessary layers and parameters from the original head
         self.probe = original_head.probe
         self.attention = original_head.attention
         
         self.layernorm = original_head.layernorm
         self.mlp = original_head.mlp
+        # self.proj = nn.Parameter(torch.randn(3, 768, 1024),requires_grad=True)
 
     def forward(self, hidden_state: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         batch_size = hidden_state.shape[0]
@@ -57,13 +59,15 @@ class SigLIPKProbeHead(nn.Module):
         if attention_mask is not None:
             raise ValueError("Custom SigLIP k-probe head does not support attention_mask.")
 
-        hidden_state = self.attention(probe, hidden_state, hidden_state)[0]
+        hidden_state, attn_weights = self.attention(probe, hidden_state, hidden_state)
         residual = hidden_state
         hidden_state = self.layernorm(hidden_state)
         hidden_state = residual + self.mlp(hidden_state)
         
+        # hidden_state = torch.einsum('btd,tdh->bth', hidden_state, self.proj)
         # Return the entire tensor of shape [batch_size, num_probes, hidden_dim]
-        return hidden_state
+        
+        return hidden_state, attn_weights
 
 class SigLIPKMoeHead(nn.Module):
     """
@@ -79,7 +83,7 @@ class SigLIPKMoeHead(nn.Module):
         task_agnostic_gate: bool
     ):
         super().__init__()
-        
+        print("[WRAPPER] Substituing the Attention pooling head of SigLip2 with MOE and k-probes")
 
         self.attention = original_pooler.attention
         # self.num_heads = original_pooler.num_heads 
@@ -115,8 +119,11 @@ class SigLIPKMoeHead(nn.Module):
             self.mlp.experts[i].fc1.bias.data.copy_(original_mlp_weights['fc1.bias'])
             self.mlp.experts[i].fc2.weight.data.copy_(original_mlp_weights['fc2.weight'])
             self.mlp.experts[i].fc2.bias.data.copy_(original_mlp_weights['fc2.bias'])
-  
-    def forward(self, hidden_state: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, calculate_gate_stats = False):
+
+        # To match PE method, we add a projection to 1024
+        # self.proj = nn.Parameter(torch.randn(3, 768, 1024),requires_grad=True)
+
+    def forward(self, hidden_state: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, calculate_gate_stats = True):
         """
         The new forward pass that handles MoE logic.
         """
@@ -126,7 +133,7 @@ class SigLIPKMoeHead(nn.Module):
         if attention_mask is not None:
             raise ValueError("Custom SigLIP k-probe head does not support attention_mask.")
 
-        attn_output = self.attention(probe, hidden_state, hidden_state, attn_mask=attention_mask)[0]
+        attn_output, attn_weights = self.attention(probe, hidden_state, hidden_state, attn_mask=attention_mask)
 
         residual = attn_output
         layernorm_output = self.layernorm(attn_output)
@@ -134,8 +141,13 @@ class SigLIPKMoeHead(nn.Module):
         moe_output, moe_loss, moe_stats = self.mlp(layernorm_output, calculate_gate_stats)
         
         hidden_state = residual + moe_output
-        
-        return hidden_state, moe_loss, moe_stats
+
+        # to match pe
+        # hidden_state = torch.einsum('btd,tdh->bth', hidden_state, self.proj)
+
+ 
+
+        return hidden_state, moe_loss, moe_stats, attn_weights
 
 
 
@@ -172,7 +184,7 @@ class PEMoeViT(nn.Module):
         task_agnostic_gate: bool
     ):
         super().__init__()
-        print("--- Initializing MoEVisionTransformer Wrapper ---")
+        print("[WRAPPER] Initializing MoEVisionTransformer Wrapper")
 
         if not hasattr(original_vit, 'pool_type') or original_vit.pool_type != "attn":
             raise ValueError("MoE conversion only supports VisionTransformer with pool_type='attn'.")
@@ -193,7 +205,7 @@ class PEMoeViT(nn.Module):
         self.width = original_vit.width
         self.proj_dim = original_vit.proj_dim
 
-        print("Upgrading the original AttentionPooling layer to MoEAttentionPooling...")
+        print("[WRAPPER] Substituing the original AttentionPooling layer to MoEAttentionPooling...")
         self.attn_pool = MoEAttentionPooling(
             original_pooler=original_vit.attn_pool,
             num_tasks=num_tasks,
@@ -206,8 +218,7 @@ class PEMoeViT(nn.Module):
         proj_tensor_replicated = original_vit.proj.unsqueeze(0).repeat(num_tasks, 1, 1)
         proj_tensor_replicated = proj_tensor_replicated.clone().detach().to('cuda')
         self.proj = nn.Parameter(proj_tensor_replicated, requires_grad=True)
-        
-        print("--- Wrapper Initialization Complete ---")
+        print("[WRAPPER] Wrapper Initialization Complete")
     
     # copied from original ViT of pe
     def _sample_abs_posemb(self, grid_h: int, grid_w: int):
@@ -250,23 +261,24 @@ class PEMoeViT(nn.Module):
         x = self.ln_post(x)
         return x
 
-    def _pool(self, x: torch.Tensor):
+    def _pool(self, x: torch.Tensor, return_attn_weights:bool = False):
         """The pooling logic, now using our MoE pooler."""
-        return self.attn_pool(x)
+        return self.attn_pool(x, return_attn_weights)
 
-    def forward(self, x: torch.Tensor, **kwargs):
+    def forward(self, x: torch.Tensor, return_attn_weights:bool =False, **kwargs):
         """The main forward pass for the wrapped MoE Vision Transformer."""
         x = self.forward_features(x, **kwargs)
         
         # Pooling step now returns three values
-        x, loss, gate_stats = self._pool(x)
+        x, loss, gate_stats,attn_weights = self._pool(x, return_attn_weights=return_attn_weights)
         
         # The projection layer is applied only to the final tensor output
         if self.proj is not None:
             # Einsum handles the projection on the last dimension of the multi-token output
             x = torch.einsum('btd,tdh->bth', x, self.proj)
-
-        return x, loss, gate_stats
+        
+        print(x.shape)
+        return x, loss, gate_stats, attn_weights
 
 
 class MoEAttentionPooling(nn.Module):
@@ -290,7 +302,7 @@ class MoEAttentionPooling(nn.Module):
         new_probe_data = original_probe_data.repeat(1, num_tasks // original_probe_data.shape[1] + 1, 1)[:, :num_tasks, :]
         self.probe = nn.Parameter(new_probe_data)
 
-        # 3. Build and seed the MoE-based MLP replacement
+        #  Build and seed the MoE-based MLP replacement
         embed_dim = original_pooler.embed_dim
         self.mlp = MoELayerTaskAware(
             input_dim=embed_dim,
@@ -310,13 +322,12 @@ class MoEAttentionPooling(nn.Module):
             self.mlp.experts[i].fc2.weight.data.copy_(original_mlp_weights['c_proj.weight'])
             self.mlp.experts[i].fc2.bias.data.copy_(original_mlp_weights['c_proj.bias'])
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    def forward(self, x: torch.Tensor,return_attn_weights: bool = False) -> tuple[torch.Tensor, torch.Tensor, dict]:
         """The new forward pass that handles MoE logic."""
         batch_size = x.shape[0]
         probe = self.probe.repeat(batch_size, 1, 1)
         
-        attn_output = self.attention(probe, x, x, need_weights=False)[0]
-
+        attn_output, attn_weights = self.attention(probe, x, x, need_weights=return_attn_weights)
         residual = attn_output
         layernorm_output = self.layernorm(attn_output)
         
@@ -324,5 +335,5 @@ class MoEAttentionPooling(nn.Module):
         moe_output, moe_loss, moe_stats = self.mlp(layernorm_output)
         
         final_output = residual + moe_output
-        
-        return final_output, moe_loss, moe_stats
+
+        return final_output, moe_loss, moe_stats, attn_weights

@@ -1,0 +1,19 @@
+
+--- Test Results ---
+Average Loss: 1.1736
+Average Accuracy: 81.58%
+
+Per-Task Losses:
+  - Age: 1.0321
+  - Gender: 0.1197
+  - Emotion: 0.4096
+
+Per-Task Accuracies:
+  - Age: 60.35%
+  - Gender: 96.60%
+  - Emotion: 87.80%
+  - Age: 87.74% @2
+  - Gender: 100.00% @2
+  - Emotion: 95.68% @2
+
+Achieved by: /user/asessa/tesi/multitask/test_lora/ckpt/mtl_PE-Core-B16-224_ul1_8.pt

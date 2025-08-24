@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any,  Dict, List, Tuple, Type
 
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import torch
 from dotenv import load_dotenv
@@ -27,10 +28,11 @@ from utils.commons import log_to_disk, get_backbone
 from utils.datasets import get_split, resample, MTLDataset
 from config.task_config import MTLConfig
 from multitask.probe import MultiTaskProbe
+from multitask.dwa import DWALoss
 from gradnorm_pytorch import GradNormLossWeighter
 
-BACKBONE_LR_RATIO = 0.1
-BAL_LOSS_WEIGHT = 0
+BACKBONE_LR_RATIO = 0.5
+BAL_LOSS_WEIGHT = 0.05
 
 class Trainer:
     """
@@ -53,7 +55,7 @@ class Trainer:
         self.unfrozen_layers = 0 # besides attention pooling
         self.best_path=None
         self.ckpt_folder = 'ckpt'
-        self.scheduler_type = 'lr_on_platue' # or cosine
+        self.scheduler_type = 'cosine' # or lr_on_platue
         self.probing_type = (
             'k-probe' if self.args.k_probes
             else 'mhca-moe' if self.args.moe
@@ -78,8 +80,8 @@ class Trainer:
         # dynamic unfreezing
         self.unfreeze_on_plateau = True  
         self.unfreeze_step = 1           
-        self.unfreeze_patience = 2       
-        self.max_unfrozen_layers = 12     
+        self.unfreeze_patience = 1     
+        self.max_unfrozen_layers = 6     
 
         # State trackers for the dynamic strategy
         self.plateau_counter = 0
@@ -116,7 +118,7 @@ class Trainer:
     def _setup_model_and_optimizer(self):
         """Initializes the model, optimizer, and scheduler."""
         print("[TRAINER] Setting up model and optimizer...")
-        backbone, self.transform, hidden_size = get_backbone(self.args.version, self.args.ckpt_path)
+        backbone, self.transform, hidden_size = get_backbone(self.args.version, not self.args.testing)
 
         task_dims = {task.name.lower(): task.num_classes for task in self.config.tasks}
         
@@ -126,11 +128,10 @@ class Trainer:
             tasks=task_dims,
             use_moe=self.args.moe,
             use_k_probes=self.args.k_probes,
-            uncertainty_weighting_for_bal = 0
+            uncertainty_weighting_for_bal =  BAL_LOSS_WEIGHT,
+            use_lora = self.config.use_lora 
         ).to(self.device)
-
         # self.mtl_probe = torch.compile(self.mtl_probe)
-
         # grad norm requires that at least one other layer is unfrozen
         initial_unfrozen_layers = self.args.initial_ul
         
@@ -188,7 +189,7 @@ class Trainer:
             self.optimizer.add_param_group(param_group_dict)
 
         print("[Optimizer] Successfully added new parameters to the existing optimizer.")
-
+        
         if isinstance(self.scheduler, ReduceLROnPlateau):
             print("[Scheduler] Re-initializing ReduceLROnPlateau scheduler.")
             self.scheduler = ReduceLROnPlateau(
@@ -199,7 +200,7 @@ class Trainer:
             print("[Scheduler] Re-initializing CosineAnnealingWarmRestarts scheduler.")
             self.scheduler = CosineAnnealingWarmRestarts(
                 self.optimizer, 
-                T_0=10, 
+                T_0=5, 
                 T_mult=2
             )
             
@@ -257,6 +258,19 @@ class Trainer:
                 print(f"[TRAINER] Using weighted loss for task: {task.name}")
             self.criterions[task.name] = task.criterion(**params)
 
+        if self.config.use_dwa:
+            print("Initializing Dynamic Weight Averaging state...")
+            num_tasks = len(self.config.tasks)
+            self.dwa_temperature =  2.0
+            
+            initial_weights = torch.ones(num_tasks) / num_tasks
+            initial_losses = torch.ones(num_tasks)
+            
+            self.dwa_task_weights = initial_weights.to(self.device)
+            self.dwa_avg_losses_last_epoch = initial_losses.to(self.device)
+            
+            self.dwa_current_epoch_loss_sum = torch.zeros(num_tasks).to(self.device)
+            self.dwa_num_batches = 0
 
     def eval_unfreeze_dynamic(self, val_accuracy):
         """Evaluates if it's necessary to unfreeze more layers of the backbone, and does so if needed """
@@ -272,7 +286,8 @@ class Trainer:
             if self.plateau_counter >= self.unfreeze_patience:
                 if self.unfrozen_layers < self.max_unfrozen_layers:
                     print(f"[ACTION] Validation accuracy plateaued for {self.unfreeze_patience} epochs. Unfreezing {self.unfreeze_step} more layers.")
-                    
+                    if self.unfreeze_patience == 1:
+                        self.unfreeze_patience = 1
                     self.unfreeze_layers(self.unfrozen_layers + self.unfreeze_step) 
                     self.unfrozen_layers += self.unfreeze_step
                     self.plateau_counter = 0
@@ -302,13 +317,31 @@ class Trainer:
 
 
             print(f"\n[TRAINING] Epoch {epoch + 1}/{self.args.epochs}")
-            
+            if self.config.use_dwa:
+                self.dwa_current_epoch_loss_sum.zero_()
+                self.dwa_num_batches = 0
+
+
             train_results = self._run_epoch(self.train_loader, is_training=True, epoch_idx=epoch)
             #   self.mtl_probe.print_requires_grad()  # Debugging: print requires_grad status
             print(f"[LOGGING] TRAINING Avg Loss: {train_results['avg_loss']:.4f}, Task Losses: {train_results['task_losses']}")
             
+            if self.config.use_dwa and self.dwa_num_batches > 0:
+                avg_losses_current_epoch = self.dwa_current_epoch_loss_sum / self.dwa_num_batches
+                
+                if epoch == 0:
+                    self.dwa_avg_losses_last_epoch = avg_losses_current_epoch
+                else:
+                    loss_ratios = avg_losses_current_epoch / self.dwa_avg_losses_last_epoch
+                    new_weights = F.softmax(loss_ratios / self.dwa_temperature, dim=0)
+                    
+                    self.dwa_task_weights = new_weights
+                    self.dwa_avg_losses_last_epoch = avg_losses_current_epoch
+
+                    print(f"[DWA] weights updated for next epoch: {self.dwa_task_weights.cpu().numpy()}")
+
             val_results = self._run_epoch(self.val_loader, is_training=False, description="Validating")
-            print(f"[LOGGING] VALIDATION Avg Loss: {val_results['avg_loss']:.4f}, Task Accuracies: {val_results['accuracies']}")
+            print(f"[LOGGING] VALIDATION Avg Loss: {val_results['avg_loss']:.4f}, Avg Accuracy: {val_results['avg_accuracy']} , Task Accuracies: {val_results['accuracies']}")
             
             if isinstance(self.scheduler, ReduceLROnPlateau):
                 self.scheduler.step(val_results['avg_loss'])
@@ -324,7 +357,7 @@ class Trainer:
             
             val_accuracy = val_results['avg_accuracy']
             val_age = val_results['task_losses']['Age']
-
+            self.mtl_probe.log_probe_similarity()
             # dynamic un-freezing logic 
             if self.unfreeze_on_plateau:
                 self.eval_unfreeze_dynamic(val_accuracy)
@@ -427,10 +460,21 @@ class Trainer:
                         self.optimizer.step()
                         self.optimizer.zero_grad()
                     else:
+                        #weight_before_update = self.mtl_probe.strategy.found_param.clone().detach()
                         self.scaler.scale(loss).backward()
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
-
+                        #print(self.mtl_probe.strategy.found_param)
+                        #are_weights_same = torch.equal(weight_before_update, self.mtl_probe.strategy.found_param)
+                        #print(f"  - Grad Norm: {self.mtl_probe.strategy.found_param.grad.norm().item()}")
+                        #print(f"  - Grad Mean: {self.mtl_probe.strategy.found_param.grad.mean().item()}")
+                        #print(f"  - Has NaNs: {torch.isnan(self.mtl_probe.strategy.found_param.grad).any().item()}")
+                        #print(weight_before_update)
+                        #print(self.mtl_probe.strategy.found_param)
+                        #if not are_weights_same:
+                        #    print("✅ The specific weight was modified.")
+                        #else:
+                        #    print("❌ The specific weight was NOT modified.")
                     if self.scheduler_type == 'cosine':
                         self.scheduler.step(epoch_idx + i / len(loader))
 
@@ -442,7 +486,7 @@ class Trainer:
                 pbar.set_description(f"{description} - Avg Loss: {total_loss / (i + 1):.4f} | Batch Losses: [{task_loss_str}]")
                 if is_training and self.scheduler:
                     pbar.set_postfix(lr=f"{self.scheduler.get_last_lr()[0]:.6f}")
-                
+                    
                 # Accumulate losses, predictions, and top-k counts
                 for idx, task in enumerate(self.config.tasks):
                     target = labels[:, idx]
@@ -487,7 +531,7 @@ class Trainer:
                                     original_image_tensor = images[valid_mask][idx]
                                     img_path = Path(valid_paths[idx])
                                     save_image(original_image_tensor, output_dir / f"{img_path.stem}.png")
-                
+                     
                 
         # --------------- EPOCH --------------- #
                   
@@ -536,18 +580,25 @@ class Trainer:
             # to avoid to add nan to the batch loss
             if torch.isfinite(task_loss):
                 unweighted_task_losses.append(task_loss)
-                if self.config.use_uncertainty_weighting and self.unfrozen_layers >= 0:
-                    weighted_loss = 0.5 * torch.exp(-self.mtl_probe.log_var[idx]) * task_loss + 0.5 * self.mtl_probe.log_var[idx]
-                    total_loss += weighted_loss
-                else: # default static weight
-                    total_loss += task_loss * task.weight 
-
                 task_losses[task.name] = task_loss.item()
-
+            else:
+                unweighted_task_losses.append(torch.tensor(0.0, device=self.device, requires_grad=True))
+        if self.config.use_uncertainty_weighting and self.unfrozen_layers >= 0:
+            for idx, task_loss in enumerate(unweighted_task_losses):
+                weighted_loss = 0.5 * torch.exp(-self.mtl_probe.log_var[idx]) * task_loss + 0.5 * self.mtl_probe.log_var[idx]
+                total_loss += weighted_loss   
+        elif self.config.use_dwa:
+            batch_losses_tensor = torch.stack(unweighted_task_losses)
+            self.dwa_current_epoch_loss_sum += batch_losses_tensor.detach()
+            self.dwa_num_batches += 1
+            total_loss = torch.sum(batch_losses_tensor * self.dwa_task_weights)      
+        else:  # Default static weight
+            for idx, task_loss in enumerate(unweighted_task_losses):
+                total_loss += task_loss * self.config.tasks[idx].weight
 
         # Add balancing loss for MoE models
         if self.args.moe:
-            if BAL_LOSS_WEIGHT == 0:
+            if BAL_LOSS_WEIGHT == 0 and self.unfrozen_layers >= 0:
                 total_loss += 0.5 * torch.exp(-self.mtl_probe.log_var[-1]) * bal_loss + 0.5 * self.mtl_probe.log_var[-1]
             else:
                 total_loss += BAL_LOSS_WEIGHT * bal_loss
@@ -564,6 +615,9 @@ class Trainer:
             loss_weights_str = ",".join([f"{w:.4f}" for w in weights_values])
         if self.use_uncertainty_weighting:
             weights_values = self.mtl_probe.log_var.detach().cpu().tolist()
+            loss_weights_str = ",".join([f"{w:.4f}" for w in weights_values])
+        if self.config.use_dwa:
+            weights_values = self.dwa_task_weights.detach().cpu().tolist()
             loss_weights_str = ",".join([f"{w:.4f}" for w in weights_values])
 
         if train_results:

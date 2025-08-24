@@ -106,7 +106,7 @@ class MoELayerTaskAware(nn.Module):
             
         return stats
 
-    def forward(self, x, calculate_gate_stats=False):
+    def forward(self, x, calculate_gate_stats=True):
         batch_size, seq_len, _ = x.shape # [batch_size, num_task, embed_dim]
         assert seq_len == self.num_tasks, "Input sequence length must match the number of tasks"
 

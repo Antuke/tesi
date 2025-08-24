@@ -31,7 +31,7 @@ def _get_backbone_pe(ckpt, version):
     backbone.load_ckpt(ckpt)
     return backbone, transform, backbone_config.output_dim
 
-def get_backbone_pe(version, print_info=False):
+def get_backbone_pe(version, print_info=False, apply_migration=False):
     """
     Load PE ViT model, return model, transforms and size of output (dimension of embedding of last token)
     """
@@ -44,6 +44,14 @@ def get_backbone_pe(version, print_info=False):
         attnpool= backbone.attn_pool
         print(f'embed_dim={attnpool.embed_dim}\nnum_heads={attnpool.num_heads}')
         print(f'OUTPUT DIM = {backbone_config.output_dim}')
+
+    def apply_migration(m):
+        if isinstance(m, pe.SelfAttention):
+            m.migrate_weights()
+    if apply_migration: # when testing/resuming no migration should be used
+        print('[MIGRATION] Migratin weights for PEFT compatibilty')
+        backbone.apply(apply_migration)
+
     return backbone, transform, backbone_config.output_dim
 
 
@@ -51,10 +59,10 @@ def get_backbone_dinov3(model_name: str="facebook/dinov3-vitb16-pretrain-lvd1689
     print(f"Loading Hugging Face model: {model_name}")
     processor = AutoProcessor.from_pretrained(model_name)
     if print_info:
-        print(f'SIGLIP PROCESSOR:\n******************\n {processor.image_processor}\n******************\n')
+        print(f'SIGLIP PROCESSOR:\n******************\n {processor}\n******************\n')
 
     # Extract image processing configuration from the loaded processor
-    image_processor_config = processor.image_processor
+    image_processor_config = processor
     image_size = image_processor_config.size['height']
     image_mean = image_processor_config.image_mean
     image_std = image_processor_config.image_std
@@ -67,12 +75,11 @@ def get_backbone_dinov3(model_name: str="facebook/dinov3-vitb16-pretrain-lvd1689
     ])
     
     # Load the model and return only the vision backbone
-    model = AutoModel.from_pretrained(model_name)
-    vision_model = model.vision_model
+    vision_model = AutoModel.from_pretrained(model_name)
 
     if print_info:
         print(f'\nVISION CONFIGS:\n{vision_model.config}')
-        print(f'\n\n***************MHAP\n{vision_model.head}')
+        print(f'\n\n\n{vision_model}')
 
 
     return vision_model, transform, vision_model.config.hidden_size
@@ -116,7 +123,7 @@ def _convert_to_rgb(image: Image.Image) -> Image.Image:
     return image.convert("RGB")
 
 
-def get_backbone(version: str, ckpt : str=None):
+def get_backbone(version: str, apply_migration : bool = False, ):
     """
     Returns vision transformer backbone
     Args:
@@ -124,13 +131,12 @@ def get_backbone(version: str, ckpt : str=None):
         ckpt: if different from null, loads backbone from .pt file specified, only for PE
     """
     if 'PE-Core-' in version:
-        if ckpt is not None:
-            return _get_backbone_pe(ckpt, version)
-        else:
-            return get_backbone_pe(version)
-    else:
+        return get_backbone_pe(version, False, apply_migration)
+    elif 'Siglip2' in version:
         return get_backbone_siglip2(version)
-
+    elif 'dinov3' in version:
+        return get_backbone_dinov3(version)
+    
 def log_to_disk(log_dir, message, mode, header = 'epoch,train_loss,val_loss,lr'):
     """
     Logs a message to a file on disk.

@@ -16,9 +16,74 @@ from config.task_config import Task, MTLConfig
 # 'PE-Core-B16-224'
 # 'PE-Core-T16-384' 
 
+supported_models = [
+    'google/Siglip2-base-patch16-224',
+    'PE-Core-B16-224',
+    'PE-Core-T16-384' 
+]   
+
+
+from datetime import datetime
+
+def log_config_to_file(config, args):
+    """
+    Creates the output directory and saves all configuration details to info.txt.
+    """
+    # 1. Define the output directory from the config
+    output_dir = config.output_folder
+    
+    # 2. Ensure the directory exists. The parents=True flag creates any missing parent folders.
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 3. Define the full path for the info file
+    info_file_path = output_dir / 'info.txt'
+    
+    print(f"Saving configuration to {info_file_path}...")
+
+    # 4. Open the file in write mode ('w') and write the information
+    with open(info_file_path, 'w') as f:
+        f.write("="*50 + "\n")
+        f.write("Experiment Configuration Details\n")
+        f.write(f"Run executed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("="*50 + "\n\n")
+
+        # --- Write Command Line Arguments ---
+        f.write("--- Command Line Arguments (args) ---\n")
+        # vars(args) converts the argparse.Namespace object to a dictionary
+        for key, value in vars(args).items():
+            f.write(f"{key}: {value}\n")
+        f.write("\n")
+
+        # --- Write MTL_TASK_CONFIG details ---
+        f.write("--- MTL Task Configuration ---\n")
+        f.write(f"output_folder: {config.output_folder}\n")
+        f.write(f"dataset_root: {config.dataset_root}\n")
+        f.write(f"train_csv: {config.train_csv}\n")
+        f.write(f"val_csv: {config.val_csv}\n")
+        f.write(f"test_csv: {config.test_csv}\n")
+        f.write(f"use_uncertainty_weighting: {config.use_uncertainty_weighting}\n")
+        f.write(f"use_grad_norm: {config.use_grad_norm}\n")
+        f.write(f"grad_norm_alpha: {config.grad_norm_alpha}\n")
+        f.write(f"use_lora: {config.use_lora}\n")
+        f.write(f"use_dwa: {config.use_dwa}\n\n")
+        
+        # --- Write Individual Task details ---
+        f.write("--- Individual Tasks ---\n")
+        for i, task in enumerate(config.tasks, 1):
+            f.write(f"  Task {i}: {task.name}\n")
+            f.write(f"    class_labels: {task.class_labels}\n")
+            f.write(f"    criterion: {task.criterion.__name__}\n")
+            f.write(f"    weight: {task.weight}\n")
+            if hasattr(task, 'use_weighted_loss'):
+                 f.write(f"    use_weighted_loss: {task.use_weighted_loss}\n")
+            f.write("\n")
+            
+    print("Configuration saved successfully.")
+
+CHOSEN = 1
 def main():
     parser = argparse.ArgumentParser(description="Train and validate attention probes for different tasks.")
-    parser.add_argument('--version', type=str, default='PE-Core-B16-224', help='Backbone model version.')
+    parser.add_argument('--version', type=str, default=supported_models[CHOSEN], help='Backbone model version.')
     parser.add_argument('--ckpt_path', type=str, help='Path to the backbone checkpoint. Only for PE models.')
     parser.add_argument('--resume_from_ckpt', type=str, help='Path to a probe checkpoint to resume training from.')
     parser.add_argument('--epochs', type=int, default=280, help='Number of training epochs.')
@@ -26,14 +91,13 @@ def main():
     # parser.add_argument('--csv_path_gender', type=str,default='/user/asessa/dataset tesi/gender_labels_cropped.csv' ,help='Path to the CSV file with labels for training split.')
     # parser.add_argument('--csv_path_emotions', type=str, default='/user/asessa/dataset tesi/emotion_labels_cropped.csv', help='Path to the CSV file with labels for training split.')
     # parser.add_argument('--csv_path_age', type=str, help='Path to the CSV file with labels for training split.')
-    parser.add_argument('--num_layers_to_unfreeze', type=int, default='0',  help='How many layers to unfreeze.')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size for training.')
-    parser.add_argument('--learning_rate', type=float, default=0.0001, help='Learning rate for optimizer.')
-    parser.add_argument('--moe', type=bool, default=True, help='Use task-aware mixture of experts.')
+    parser.add_argument('--learning_rate', type=float, default=0.0003, help='Learning rate for optimizer.')
+    parser.add_argument('--moe', type=bool, default=False, help='Use task-aware mixture of experts.')
     parser.add_argument('--k_probes', type=bool, default=False, help='Use k-task specific probes to produce three distinct task-embeddings for each classifier head')
     parser.add_argument('--testing', type=bool, default=False, help='Skip straight to testing')
-    parser.add_argument('--load_pt', type=bool, default=False, help='Load pre-trained heads from .pt files')
-    parser.add_argument('--initial_ul' , type=int, default=-1, help='How many layers to unfreeze at the start of training. If 0, only attn_pool layer is unfrozen. If -1 only the heads are trained (no mt learning)')
+    parser.add_argument('--load_pt', type=bool, default=True, help='Load pre-trained heads from .pt files')
+    parser.add_argument('--initial_ul' , type=int, default=0, help='How many layers to unfreeze at the start of training. If 0, only attn_pool layer is unfrozen. If -1 only the heads are trained (no mt learning)')
     args = parser.parse_args()
     print('Start training with the following args:')
     print(args)
@@ -58,23 +122,29 @@ def main():
     csvs without VGG: 
     /user/asessa/dataset tesi/small_train.csv
     /user/asessa/dataset tesi/mtl_test.csv
+
+    debug:
+    /user/asessa/dataset tesi/fast_testing.csv
     """
 
     MTL_TASK_CONFIG = MTLConfig(
-    tasks=[
-        Task(name='Age', class_labels=["0-2","3-9", "10-19", "20-29", "30-39", "40-49", "50-59", "60-69", "70+"], criterion=torch.nn.CrossEntropyLoss, weight=1.0, use_weighted_loss=True),
-        Task(name='Gender', class_labels=["Male", "Female"], criterion=torch.nn.CrossEntropyLoss, weight=1.0),
-        Task(name='Emotion', class_labels=["Surprise", "Fear", "Disgust", "Happy", "Sad", "Angry", "Neutral"], criterion=torch.nn.CrossEntropyLoss, weight=1.0, use_weighted_loss=True)
-    ],
-        output_folder=Path('./outputs_pe_no_pt'),
-        dataset_root=Path("/user/asessa/dataset tesi/"), 
-        train_csv=Path("/user/asessa/dataset tesi/small_train.csv"),
-        val_csv=Path("/user/asessa/dataset tesi/mtl_test.csv"),
-        test_csv=Path("/user/asessa/dataset tesi/mtl_test.csv"),
-        use_uncertainty_weighting=True,
-        use_grad_norm=False,
-        grad_norm_alpha=1.5
-    )
+        tasks=[
+            Task(name='Age', class_labels=["0-2","3-9", "10-19", "20-29", "30-39", "40-49", "50-59", "60-69", "70+"], criterion=torch.nn.CrossEntropyLoss, weight=1.0, use_weighted_loss=True),
+            Task(name='Gender', class_labels=["Male", "Female"], criterion=torch.nn.CrossEntropyLoss, weight=1.0),
+            Task(name='Emotion', class_labels=["Surprise", "Fear", "Disgust", "Happy", "Sad", "Angry", "Neutral"], criterion=torch.nn.CrossEntropyLoss, weight=1.0, use_weighted_loss=True)
+        ],
+            output_folder=Path('./outputs_lora_default'),
+            dataset_root=Path("/user/asessa/dataset tesi/"), 
+            train_csv=Path("/user/asessa/dataset tesi/small_train.csv"),
+            val_csv=Path("/user/asessa/dataset tesi/mtl_test.csv"),
+            test_csv=Path("/user/asessa/dataset tesi/mtl_test.csv"),
+            use_uncertainty_weighting=True,
+            use_grad_norm=False,
+            grad_norm_alpha=1.5,
+            use_lora=True,
+            use_dwa=False
+        )
+
     if not torch.cuda.is_available():
         print("CUDA is not available. Exiting.")
         sys.exit(1)
@@ -88,6 +158,7 @@ def main():
 
     try:
         trainer = Trainer(config=task_config, args=args)
+        log_config_to_file(MTL_TASK_CONFIG, args)
         if args.load_pt:
             if 'google' in args.version:
                 trainer.load_heads(pre_traiend_heads_siglip)

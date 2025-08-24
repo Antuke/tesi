@@ -17,6 +17,7 @@ import seaborn as sns
 import torch.nn.functional as F
 import torch
 import torch.nn as nn
+from peft import PeftModel, get_peft_model, LoraConfig, TaskType
 
 
 from core.vision_encoder import pe 
@@ -27,7 +28,20 @@ DROPOUT_P = 0.5
 DEVICE = 'cuda' 
 
 
-
+def print_trainable_parameters(model):
+    """
+    Prints the number of trainable parameters in the model.
+    """
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    print(
+        f"trainable params: {trainable_params} || all params: {all_param} || "
+        f"trainable%: {100 * trainable_params / all_param:.2f}"
+    )
 
 def _get_classifier_head(in_dim: int, out_dim: int, dropout_p: float = 0.0) -> nn.Sequential:
     """Creates a classifier head with dropout and a linear layer."""
@@ -55,7 +69,8 @@ class MultiTaskProbe(nn.Module):
                  moe_num_experts: int = 8,
                  moe_top_k: int = 2,
                  task_agnostic_gate: bool = False,
-                 uncertainty_weighting_for_bal : int = 0):
+                 uncertainty_weighting_for_bal : int = 0,
+                 use_lora: bool = False):
 
         super().__init__()
         
@@ -70,11 +85,15 @@ class MultiTaskProbe(nn.Module):
             task_name: _get_classifier_head(backbone_output_dim, out_dim, DROPOUT_P)
             for task_name, out_dim in self.tasks.items()
         })
-        self.strategy = backbone_strategy_factory(backbone, self.num_tasks, task_agnostic_gate)      
+        self.use_lora = use_lora
+        self.strategy = backbone_strategy_factory(backbone, self.num_tasks, task_agnostic_gate, use_lora)      
         self._setup_layers(num_layers_to_unfreeze, moe_num_experts, moe_top_k)
         # used for Uncertainty Weights (if uncertainty_weighting_for_bal is more than 0, it will also weight that additional loss)
-        self.log_var = nn.Parameter(torch.zeros(self.num_tasks + uncertainty_weighting_for_bal))
-        
+        if uncertainty_weighting_for_bal == 0:
+            print("[PROBE] Using uncertainty weighting for balancing loss.")
+            self.log_var = nn.Parameter(torch.zeros(self.num_tasks + 1))  # +1 for the balancing loss
+        else:
+            self.log_var = nn.Parameter(torch.zeros(self.num_tasks ))
         # was used for gradNorm, now using gradnorm-pytorch module
         # self.loss_weights = nn.Parameter(torch.ones(self.num_tasks))
 
@@ -92,12 +111,12 @@ class MultiTaskProbe(nn.Module):
         return self.strategy.get_last_shared_layer()
 
 
-    def forward(self, x: torch.Tensor, return_shared: bool = False) -> dict:
+    def forward(self, x: torch.Tensor, return_shared: bool = False, return_attn_weights: bool = False) -> dict:
         """
         Forward pass through the model.
         Always returns a dictionary.
         """
-        shared_features, balancing_loss, stats = self.strategy.forward(x)
+        shared_features, balancing_loss, stats, attn_weights = self.strategy.forward(x)
 
         # If using k-probes or MoE, we expect per-task embeddings
         if self.use_k_probes or self.use_moe:
@@ -122,7 +141,9 @@ class MultiTaskProbe(nn.Module):
 
         if return_shared:
             outputs["shared_features"] = shared_features
-            
+        
+        if attn_weights is not None and return_attn_weights:
+            outputs["attn_weights"] = attn_weights
         # No more complex logic, just return the dictionary
         return outputs
 
@@ -177,7 +198,7 @@ class MultiTaskProbe(nn.Module):
 
                     # The head is a Sequential(Dropout, Linear). We load into the Linear layer.
                     head[2].load_state_dict(new_state_dict)
-                    print(f"Successfully loaded weights for '{task_name}' head from {ckpt_path}")
+                    print(f"[SETUP] Successfully loaded weights for '{task_name}' head from {ckpt_path}")
                 except FileNotFoundError:
                     print(f"ERROR: Head checkpoint not found for '{task_name}' at '{ckpt_path}'.")
                 except Exception as e:
@@ -189,27 +210,47 @@ class MultiTaskProbe(nn.Module):
         """Saves a checkpoint with trainable weights and optimizer state."""
         try:
 
-            checkpoint = {
-                'epoch': epoch,
-                'model_state_dict':  self.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict()
-            }
-            torch.save(checkpoint, path)
-            print(f"Successfully saved multi-task checkpoint to: {path}")
+            if self.use_lora:
+
+                print(f"[SAVING] Saving LoRa, head and backbone")
+                checkpoint = {
+                    'epoch': epoch,
+                    'head_state_dict':  self.heads.state_dict(),
+                    'backbone_state_dict': self.strategy.backbone.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict()
+                }
+                torch.save(checkpoint, path)
+
+            else:
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict':  self.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict()
+                }
+                torch.save(checkpoint, path)
+            print(f"[SAVING] Successfully saved multi-task checkpoint to: {path}")
         except Exception as e:
             print(f"Error saving multi-task checkpoint to {path}: {e}")
 
-    def load(self, path: str, optimizer: Optional[torch.optim.Optimizer] = None, scheduler = None, device: str = 'cuda'):
+    def load(self, path: str, optimizer = None, scheduler = None, device: str = 'cuda', print_loaded_layer: bool = False):
         """Loads a multi-task checkpoint into the model and optimizer."""
         try:
             checkpoint = torch.load(path, map_location=device, weights_only=False)
             # Use strict=False to only load parameters present in the checkpoint
-            self.load_state_dict(checkpoint['model_state_dict'], strict=True)
-            print("--- Layers found in checkpoint ---")
-            for layer_name in checkpoint['model_state_dict'].keys():
-                print(layer_name)
-            print("------------------------------------")
+            if 'model_state_dict' in checkpoint:
+                self.load_state_dict(checkpoint['model_state_dict'], strict=True)
+            if print_loaded_layer:
+                print("--- Layers found in checkpoint ---")
+                for layer_name in checkpoint['model_state_dict'].keys():
+                    print(layer_name)
+                    print("------------------------------------")
+            if 'head_state_dict' in checkpoint and 'backbone_state_dict':
+                print(f'[LOADING] Found head and backbone dict separeted, from a LoRa trained model!')
+                self.heads.load_state_dict(checkpoint['head_state_dict'], strict=True)
+                self.strategy.backbone.load_state_dict(checkpoint['backbone_state_dict'], strict=True)
+
             if optimizer and 'optimizer_state_dict' in checkpoint:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             if scheduler and 'scheduler_state_dict' in checkpoint:
@@ -223,7 +264,7 @@ class MultiTaskProbe(nn.Module):
             print(f"An error occurred while loading the multi-task checkpoint: {e}")
             return 0
 
-    def log_probe_similarity(self, file_path: str = "probe_similarity.jpg", title: str = "Probe Similarity Matrix"):
+    def log_probe_similarity(self, file_path: str = "./probe_similarity.jpg", title: str = "Probe Similarity Matrix"):
         """Calculates and plots the cosine similarity matrix of the probes."""
         if not self.use_k_probes and not self.use_moe:
             print("Probe similarity logging is only available for k-probes or MoE setups.")
