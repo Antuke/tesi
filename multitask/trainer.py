@@ -713,8 +713,8 @@ class Trainer:
     def _send_telegram_message(self, message: str):
         """Sends a message to a Telegram chat using credentials from the config."""
         # Get credentials from your config object. Use getattr for safety.
-        token = "8391904304:AAH5gTZtM82rVhz6N-30jv5sji2-NwdXVkI"
-        chat_id = "1220514183"
+        token = ""
+        chat_id = ""
 
         if not token or not chat_id:
             # Silently fail if credentials are not set
