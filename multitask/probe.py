@@ -25,6 +25,7 @@ from utils.commons import *
 from multitask.wrappers import SigLIPKMoeHead, SigLIPKProbeHead, PEMoeViT
 from multitask.strategies import backbone_strategy_factory
 DROPOUT_P = 0.5
+HIDDE_DIM_RATIO = 4
 DEVICE = 'cuda' 
 
 
@@ -43,6 +44,10 @@ def print_trainable_parameters(model):
         f"trainable%: {100 * trainable_params / all_param:.2f}"
     )
 
+class CnnHead(nn.Module):
+    pass
+
+
 def _get_classifier_head(in_dim: int, out_dim: int, dropout_p: float = 0.0) -> nn.Sequential:
     """Creates a classifier head with dropout and a linear layer."""
     return nn.Sequential(
@@ -50,6 +55,34 @@ def _get_classifier_head(in_dim: int, out_dim: int, dropout_p: float = 0.0) -> n
         nn.Dropout(p=dropout_p),
         nn.Linear(in_dim, out_dim)
     )
+
+def _get_classifier_head_deeper(in_dim: int, 
+                         out_dim: int, 
+                         dropout_p: float = 0.0,
+                         hidden_dims: list[int] = []) -> nn.Sequential:
+    """
+    Creates a classifier head. If hidden_dims is empty, it's a single linear layer
+    with dropout. Otherwise, it creates a multi-layer MLP head.
+    """
+    layers = [
+        nn.BatchNorm1d(in_dim),
+        nn.Dropout(p=dropout_p)
+    ]
+    
+    current_dim = in_dim
+    
+    # Add hidden MLP layers if specified
+    if hidden_dims:
+        for h_dim in hidden_dims:
+            layers.append(nn.Linear(current_dim, h_dim))
+            layers.append(nn.GELU())
+            layers.append(nn.Dropout(p=dropout_p))
+            current_dim = h_dim
+            
+    # Final output layer
+    layers.append(nn.Linear(current_dim, out_dim))
+    
+    return nn.Sequential(*layers)
 
 
 
@@ -70,7 +103,8 @@ class MultiTaskProbe(nn.Module):
                  moe_top_k: int = 2,
                  task_agnostic_gate: bool = False,
                  uncertainty_weighting_for_bal : int = 0,
-                 use_lora: bool = False):
+                 use_lora: bool = False,
+                 deeper_classification_heads:bool = False):
 
         super().__init__()
         
@@ -81,10 +115,17 @@ class MultiTaskProbe(nn.Module):
         self.num_tasks = len(tasks)
         self.use_k_probes = use_k_probes
         self.use_moe = use_moe
-        self.heads = nn.ModuleDict({
-            task_name: _get_classifier_head(backbone_output_dim, out_dim, DROPOUT_P)
-            for task_name, out_dim in self.tasks.items()
-        })
+        self.attention_probing = False
+        if deeper_classification_heads:
+            self.heads = nn.ModuleDict({
+                task_name: _get_classifier_head_deeper(backbone_output_dim, out_dim, DROPOUT_P, hidden_dims=[backbone_output_dim // HIDDE_DIM_RATIO])
+                for task_name, out_dim in self.tasks.items()
+            })
+        else:
+            self.heads = nn.ModuleDict({
+                task_name: _get_classifier_head(768, out_dim, DROPOUT_P)
+                for task_name, out_dim in self.tasks.items()
+            })
         self.use_lora = use_lora
         self.strategy = backbone_strategy_factory(backbone, self.num_tasks, task_agnostic_gate, use_lora)      
         self._setup_layers(num_layers_to_unfreeze, moe_num_experts, moe_top_k)
@@ -104,7 +145,10 @@ class MultiTaskProbe(nn.Module):
             self.strategy.enable_moe(self.num_tasks,moe_num_experts, moe_top_k)
         elif self.use_k_probes:
             self.strategy.enable_k_probes()
-            
+        elif self.attention_probing:
+            print("ATTENTION PROBING")
+            self.strategy.enable_attn_probing()
+
         self.strategy.setup_layers(num_layers_to_unfreeze)
 
     def get_last_shared_layer(self):
@@ -183,6 +227,9 @@ class MultiTaskProbe(nn.Module):
 
     def load_heads(self, ckpt_paths: Dict[str, str], device: str = 'cuda'):
         """Loads weights from checkpoints into the respective heads."""
+        checkpoint = torch.load(ckpt_paths, map_location=device, weights_only=False)
+        self.heads.load_state_dict(checkpoint['head_state_dict'], strict=True)
+        return
         for task_name, head in self.heads.items():
              if ckpt_path := ckpt_paths.get(task_name):
                 try:

@@ -16,11 +16,6 @@ from config.task_config import Task, MTLConfig
 # 'PE-Core-B16-224'
 # 'PE-Core-T16-384' 
 
-supported_models = [
-    'google/Siglip2-base-patch16-224',
-    'PE-Core-B16-224',
-    'PE-Core-T16-384' 
-]   
 
 
 from datetime import datetime
@@ -80,7 +75,14 @@ def log_config_to_file(config, args):
             
     print("Configuration saved successfully.")
 
-CHOSEN = 1
+
+supported_models = [
+    'google/Siglip2-base-patch16-224',
+    'PE-Core-B16-224',
+    'PE-Core-T16-384' 
+]   
+
+CHOSEN = 0
 def main():
     parser = argparse.ArgumentParser(description="Train and validate attention probes for different tasks.")
     parser.add_argument('--version', type=str, default=supported_models[CHOSEN], help='Backbone model version.')
@@ -92,12 +94,13 @@ def main():
     # parser.add_argument('--csv_path_emotions', type=str, default='/user/asessa/dataset tesi/emotion_labels_cropped.csv', help='Path to the CSV file with labels for training split.')
     # parser.add_argument('--csv_path_age', type=str, help='Path to the CSV file with labels for training split.')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size for training.')
-    parser.add_argument('--learning_rate', type=float, default=0.0003, help='Learning rate for optimizer.')
+    parser.add_argument('--learning_rate', type=float, default=0.0001, help='Learning rate for optimizer.')
     parser.add_argument('--moe', type=bool, default=False, help='Use task-aware mixture of experts.')
-    parser.add_argument('--k_probes', type=bool, default=False, help='Use k-task specific probes to produce three distinct task-embeddings for each classifier head')
+    parser.add_argument('--k_probes', type=bool, default=True, help='Use k-task specific probes to produce three distinct task-embeddings for each classifier head')
     parser.add_argument('--testing', type=bool, default=False, help='Skip straight to testing')
-    parser.add_argument('--load_pt', type=bool, default=True, help='Load pre-trained heads from .pt files')
+    parser.add_argument('--load_pt', type=bool, default=False, help='Load pre-trained heads from .pt files')
     parser.add_argument('--initial_ul' , type=int, default=0, help='How many layers to unfreeze at the start of training. If 0, only attn_pool layer is unfrozen. If -1 only the heads are trained (no mt learning)')
+    parser.add_argument('--deeper_classification_heads', type=bool, default=False, help='2 hidden layers in the classfiication heads')
     args = parser.parse_args()
     print('Start training with the following args:')
     print(args)
@@ -122,10 +125,22 @@ def main():
     csvs without VGG: 
     /user/asessa/dataset tesi/small_train.csv
     /user/asessa/dataset tesi/mtl_test.csv
+    /user/asessa/dataset tesi/fairface_adiance_raf_affect.csv
+    /user/asessa/dataset tesi/adience_data_filtered_cropped.csv
+    /user/asessa/dataset tesi/small_train_age_gender.csv
+
+    # TEST SETS!
+    /user/asessa/dataset tesi/test_sets/fairface-test.csv
+    /user/asessa/dataset tesi/test_sets/raf-db-test.csv
+    /user/asessa/dataset tesi/test_sets/utk-test.csv
+    /user/asessa/dataset tesi/datasets_with_standard_labels/VggFace2/test/vgg_labels_test.csv
+    
 
     debug:
     /user/asessa/dataset tesi/fast_testing.csv
     """
+    # /user/asessa/dataset tesi/test_sets/fairface-test.csv
+    # /user/asessa/dataset tesi/test_sets/utk-test.csv
 
     MTL_TASK_CONFIG = MTLConfig(
         tasks=[
@@ -133,11 +148,11 @@ def main():
             Task(name='Gender', class_labels=["Male", "Female"], criterion=torch.nn.CrossEntropyLoss, weight=1.0),
             Task(name='Emotion', class_labels=["Surprise", "Fear", "Disgust", "Happy", "Sad", "Angry", "Neutral"], criterion=torch.nn.CrossEntropyLoss, weight=1.0, use_weighted_loss=True)
         ],
-            output_folder=Path('./outputs_lora_default'),
+            output_folder=Path('./test_ap_lora_k_probes_mlp'),
             dataset_root=Path("/user/asessa/dataset tesi/"), 
-            train_csv=Path("/user/asessa/dataset tesi/small_train.csv"),
+            train_csv=Path("/user/asessa/dataset tesi/fairface_adiance_raf_affect.csv"),
             val_csv=Path("/user/asessa/dataset tesi/mtl_test.csv"),
-            test_csv=Path("/user/asessa/dataset tesi/mtl_test.csv"),
+            test_csv=Path("/user/asessa/dataset tesi/mtl_test_uncropped.csv"),
             use_uncertainty_weighting=True,
             use_grad_norm=False,
             grad_norm_alpha=1.5,

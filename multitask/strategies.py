@@ -1,4 +1,5 @@
-"""This files contains the concrete strategies and factory for those strategies used by the MultiTaskProbe class
+"""This files contains the concrete strategies and factory for those strategies used by the MultiTaskProbe class.
+The stategies manages the shared backbone.
 """
 
 
@@ -8,7 +9,7 @@ import types
 from typing import Optional, Dict, Tuple
 from abc import ABC, abstractmethod
 from enum import Enum
-
+from collections import OrderedDict
 from dotenv import load_dotenv
 load_dotenv()
 sys.path.append(os.getenv("REPO_PATH"))
@@ -18,15 +19,115 @@ import seaborn as sns
 import torch.nn.functional as F
 import torch
 import torch.nn as nn
-from peft import PeftModel, get_peft_model, LoraConfig, TaskType
+from peft import  get_peft_model, LoraConfig, TaskType, PeftModel
 
 from core.vision_encoder import pe 
 from utils.commons import *
-from multitask.wrappers import SigLIPKMoeHead, SigLIPKProbeHead, PEMoeViT
+from multitask.wrappers import SigLIPKMoeHead, SigLIPKProbeHead, PEMoeViT, SigLIPKProbeHeadExperimental
 
 DROPOUT_P = 0.5
 DEVICE = 'cuda' 
 
+class EfficientProbingHead(nn.Module):
+    """
+    An attention pooling module adapted specifically for the 
+    Efficient Probing (EP) methodology.
+
+    This module uses learnable queries (probes) to aggregate features
+    from a frozen backbone via cross-attention. It is designed to be
+    lightweight, omitting the MLP block and residual connections found
+    in full Transformer layers.
+    """
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        num_probes: int = 16, # A common starting point for EP
+    ):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.num_probes = num_probes
+
+        assert (
+            self.embed_dim % num_heads == 0
+        ), "embed_dim must be divisible by num_heads"
+
+        # These learnable vectors are the "probes" or queries.
+        self.probes = nn.Parameter(torch.randn(1, self.num_probes, self.embed_dim))
+        
+        # The core cross-attention mechanism.
+        self.attn = nn.MultiheadAttention(
+            self.embed_dim, self.num_heads, batch_first=True
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): The patch tokens from the frozen backbone.
+                              Shape: (batch, num_patches, embed_dim)
+        
+        Returns:
+            torch.Tensor: The aggregated feature vectors from the probes.
+                          Shape: (batch, num_probes, embed_dim)
+        """
+        batch_size = x.shape[0]
+        
+        # Repeat the learnable probes for each item in the batch.
+        q = self.probes.repeat(batch_size, 1, 1)
+
+        # Apply cross-attention.
+        # q = probes, k = patch tokens, v = patch tokens
+        # The output is the aggregated feature vector for each probe.
+        attn_output, _ = self.attn(q, x, x, need_weights=False)
+        
+        return attn_output
+
+class AttentionPooling(nn.Module):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        num_probe: int = 1,
+        mlp_ratio: int = 4,
+        act_layer  = nn.GELU,
+        norm_layer = nn.LayerNorm,
+    ):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+
+        assert (
+            self.embed_dim % num_heads == 0
+        ), "embed_dim must be divisible by num_heads"
+
+        self.probe = nn.Parameter(torch.randn(1, num_probe, self.embed_dim))
+        self.attn = nn.MultiheadAttention(
+            self.embed_dim, self.num_heads, batch_first=True
+        )
+
+        self.layernorm = norm_layer(embed_dim)
+        self.mlp_width = int(embed_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            OrderedDict(
+                [
+                    ("c_fc", nn.Linear(self.embed_dim, self.mlp_width)),
+                    ("gelu", act_layer()),
+                    ("c_proj", nn.Linear(self.mlp_width, self.embed_dim)),
+                ]
+            )
+        )
+
+    def forward(self, x: torch.Tensor):
+        batch, _, _ = x.shape
+
+        q = self.probe.repeat((batch, 1, 1)).to(x.dtype)
+        x = self.attn(q, x, x, need_weights=False)[0]
+        x = x + self.mlp(self.layernorm(x))
+
+        return x
 
 
 def print_trainable_parameters(model):
@@ -156,7 +257,6 @@ class BackboneStrategy(nn.Module, ABC):
 
     
 class PEStrategy(BackboneStrategy):
-
     def unfreeze_and_get_new_params(self, target_num_unfrozen_layers: int):
         """
         Unfreezes additional layers and returns ONLY the newly unfrozen parameters.
@@ -169,9 +269,6 @@ class PEStrategy(BackboneStrategy):
             list: A flat list of newly unfrozen parameters.
         """
         new_param_groups = []
-
-
-
         if target_num_unfrozen_layers <= self.currently_unfrozen_layers:
             print(f"Request to unfreeze {target_num_unfrozen_layers} layers, but {self.currently_unfrozen_layers} are already unfrozen. No new layers to unfreeze.")
             return new_param_groups
@@ -184,12 +281,15 @@ class PEStrategy(BackboneStrategy):
                 lora_params = []
                 for name, param in self.backbone.named_parameters():
                     if 'lora_' in name:
-                        if 'attn_pool' not in name:
-                            print(f"[LORA] Adding LoRa matrices: {name}")
+                        print(f"[LORA] Adding LoRa matrices: {name}")
+                        lora_params.append(param)
+                    if 'gating' in name or 'probe' in name:
+                        if 'lora_' not in name:
+                            print(f"[LORA] Adding head weights: {name}")
+                            param.requires_grad = True
                             lora_params.append(param)
-
-                    if 'attn_pool' in name:
-                        print(f"[LORA] Adding attn_pool weights: {name}")
+                    if name == 'base_model.model.proj':
+                        print(f"[LORA] Adding head weights: {name}")
                         param.requires_grad = True
                         lora_params.append(param)
 
@@ -282,11 +382,9 @@ class PEStrategy(BackboneStrategy):
             if self.use_lora:
                 lora_params = []
                 for name, param in self.backbone.named_parameters():
-                    # train each lora matrices that is not in the attn_pool
                     if 'lora_' in name:
                         print(f"[LORA] Adding LoRa matrices: {name}")
                         lora_params.append(param)
-                    # train every parameter that is not a lora matrices
                     if 'gating' in name or 'probe' in name:
                         if 'lora_' not in name:
                             print(f"[LORA] Adding head weights: {name}")
@@ -343,26 +441,40 @@ class PEStrategy(BackboneStrategy):
         
         return named_param_groups
 
+
+
+    """ with fresh weights, not pre-trained """
+    def enable_attn_probing(self, num_heads=12, embed_dim=768):
+        self.backbone.attn_pool = AttentionPooling(
+            num_heads = 12, embed_dim = 768
+        )
+        self.backbone.proj_dim = None
+        
+        
+
+
     def enable_moe(self, num_tasks: int, num_experts: int, top_k: int):
         self.backbone = PEMoeViT(self.backbone, num_tasks=num_tasks, num_experts=num_experts, top_k=top_k, task_agnostic_gate=self.task_agnostic_gate)
     
-    def enable_k_probes(self):
+    def enable_k_probes(self, task_proj = False):
         original_probe = self.backbone.attn_pool.probe.data
         new_probes = original_probe.repeat(1, self.num_tasks, 1)
         self.backbone.attn_pool.probe = nn.Parameter(new_probes)
-        if self.backbone.proj is not None:
-            self.backbone.proj = nn.Parameter(torch.stack([self.backbone.proj.clone() for _ in range(self.num_tasks)], dim=0)) 
 
-        def forward(self, x: torch.Tensor, **kwargs):
-            x = self.forward_features(x, norm=True, **kwargs)
-            x = self._pool(x)
+        if task_proj:
+            if self.backbone.proj is not None:
+                self.backbone.proj = nn.Parameter(torch.stack([self.backbone.proj.clone() for _ in range(self.num_tasks)], dim=0)) 
 
-            if self.proj_dim is not None:
-                x = torch.einsum('bnd,ndp->bnp', x, self.proj)
+            def forward(self, x: torch.Tensor, **kwargs):
+                x = self.forward_features(x, norm=True, **kwargs)
+                x = self._pool(x)
 
-            return x
+                if self.proj_dim is not None:
+                    x = torch.einsum('bnd,ndp->bnp', x, self.proj)
+                    # x = x @ self.proj
+                return x
 
-        self.backbone.forward = types.MethodType(forward, self.backbone)
+            self.backbone.forward = types.MethodType(forward, self.backbone)
 
     def get_probe(self) -> nn.Parameter:
         return self.backbone.attn_pool.probe.data
@@ -387,22 +499,24 @@ class SigLIPStrategy(BackboneStrategy):
         self.backbone.head = SigLIPKMoeHead(self.backbone.head, num_tasks=num_tasks, num_experts=num_experts, top_k=top_k, task_agnostic_gate=self.task_agnostic_gate)
 
     def enable_k_probes(self):
-        original_probe = self.backbone.head.probe.data
-        new_probes = original_probe.repeat(1, self.num_tasks, 1)
-        self.backbone.head.probe = nn.Parameter(new_probes)
-        self.backbone.head = SigLIPKProbeHead(self.backbone.head)
+        #original_probe = self.backbone.head.probe.data
+        #new_probes = original_probe.repeat(1, self.num_tasks, 1)
+        #self.backbone.head.probe = nn.Parameter(new_probes)
+        self.backbone.head = SigLIPKProbeHeadExperimental(self.backbone.head, self.num_tasks)
         
     def get_probe(self) -> nn.Parameter:
         return self.backbone.head.probe.data
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Dict]]:
-        output = self.backbone(pixel_values=x).pooler_output
+    def forward(self, x: torch.Tensor, last_hidden_state: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Dict]]:
+        if last_hidden_state:
+            return self.backbone(pixel_values=x).last_hidden_state
+
+        output, attn_weights = self.backbone(pixel_values=x).pooler_output
         if len(output) == 4: # MoE case
             shared_features, balancing_loss, stats, attn_weights = output
             return shared_features, balancing_loss, stats, attn_weights
-        if len(output) == 2: # K-probes
-            shared_features, attn_weights = output
-            return shared_features, None, None, attn_weights
+        else: 
+            return output, None, None, None
 
     def get_last_shared_layer(self) -> nn.Module:
         return self.backbone.encoder.layers[-1]
@@ -435,6 +549,7 @@ class SigLIPStrategy(BackboneStrategy):
                     print(f"Identified 'lora' parameter group with {len(lora_params)} tensors.")
                     print_trainable_parameters(self.backbone)
                 
+                self.currently_unfrozen_layers = 99
                 return new_param_groups
 
             print("Unfreezing the SigLip head parameters...")
@@ -505,10 +620,13 @@ class SigLIPStrategy(BackboneStrategy):
                 for name, param in self.backbone.named_parameters():
                     if 'lora_' in name:
                         print(f"[LORA] Adding LoRa matrices: {name}")
+                        print(param.requires_grad)
+                        param.requires_grad = True
                         lora_params.append(param)
 
                     if 'probe' in name or 'gating' in name or name == 'base_model.model.head.proj':
                         print(f"[LORA] Adding {name}")
+                        param.requires_grad = True
                         lora_params.append(param)
 
                 if lora_params:

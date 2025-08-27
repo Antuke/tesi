@@ -9,6 +9,8 @@ import torch
 from multitask.moe_task_aware import *
 from transformers.models.siglip2.modular_siglip2 import Siglip2MultiheadAttentionPoolingHead
 from dotenv import load_dotenv
+from typing import Optional, Tuple
+import copy
 load_dotenv()
 REPO_PATH = os.getenv("REPO_PATH")
 if REPO_PATH:
@@ -39,13 +41,17 @@ class SigLIPKProbeHead(nn.Module):
     """
     This module wraps the original SigLIP head layers to return all probe outputs.
     """
-    def __init__(self, original_head: Siglip2MultiheadAttentionPoolingHead):
+    def __init__(self, original_head: Siglip2MultiheadAttentionPoolingHead, num_tasks, num_probes_per_task=1):
         super().__init__()
         print("[WRAPPER] Substituing the Attention pooling head of SigLip2 with k-probes")
         # Copy necessary layers and parameters from the original head
-        self.probe = original_head.probe
-        self.attention = original_head.attention
+
+        original_probe = original_head.probe.data
+        new_probes = original_probe.repeat(1, self.num_tasks * num_probes_per_task, 1)
         
+        self.probe = nn.Parameter(new_probes)
+        self.attention = original_head.attention
+
         self.layernorm = original_head.layernorm
         self.mlp = original_head.mlp
         # self.proj = nn.Parameter(torch.randn(3, 768, 1024),requires_grad=True)
@@ -68,6 +74,84 @@ class SigLIPKProbeHead(nn.Module):
         # Return the entire tensor of shape [batch_size, num_probes, hidden_dim]
         
         return hidden_state, attn_weights
+
+
+
+class SigLIPKProbeHeadExperimental(nn.Module):
+    """
+    This module wraps the original SigLIP2 head layers.
+    It substitutes the single MLP with num_tasks distinct MLPs, one for each probe.
+    Each new MLP is seeded with the weights of the original MLP.
+    """
+    def __init__(self, original_head: Siglip2MultiheadAttentionPoolingHead, num_tasks: int, seed_probes_from_original=False):
+        super().__init__()
+        print(f"[WRAPPER] Substituting the single MLP with {num_tasks} distinct MLPs (one per task-probe).")
+        self.num_tasks = num_tasks
+        
+        #original_probe = original_head.probe.data
+        # new_probes = original_probe.repeat(1, self.num_tasks, 1)
+        if seed_probes_from_original:
+            print("[WRAPPER] Seeding new probes from the original probe.")
+            original_probe_data = original_head.probe.detach().clone()
+            new_probes_data = original_probe_data.repeat(1, self.num_tasks, 1)
+        else:
+            print("[WRAPPER] Randomly initializing new probes.")
+            new_probes_data = torch.randn(1, self.num_tasks, 768)
+            if hasattr(original_head.probe, 'data'):
+                original_std = original_head.probe.data.std()
+                new_probes_data *= original_std
+
+        self.probe = nn.Parameter(new_probes_data)    
+        self.attention = original_head.attention
+        self.layernorm = original_head.layernorm
+        
+
+        self.mlps = nn.ModuleList()
+        for _ in range(self.num_tasks):
+            self.mlps.append(ExpertSiglip())
+
+    def forward(self, hidden_state: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
+        batch_size = hidden_state.shape[0]
+        # Repeat the task-probes for the entire batch
+        # probe shape: [batch_size, num_tasks, hidden_dim]
+        probe = self.probe.repeat(batch_size, 1, 1)
+
+        if attention_mask is not None:
+            raise ValueError("Custom SigLIP k-probe head does not support attention_mask.")
+
+
+        # hidden_state shape after attention: [batch_size, num_tasks, hidden_dim]
+        hidden_state, attn_weights = self.attention(probe, hidden_state, hidden_state)
+        
+        residual = hidden_state
+        hidden_state = self.layernorm(hidden_state)
+        
+
+        # we can permute the tensor to make the task dimension the first one.
+        # Shape becomes: [num_tasks, batch_size, hidden_dim]
+        hidden_state_transposed = hidden_state.permute(1, 0, 2)
+        
+        mlp_outputs = []
+        for i in range(self.num_tasks):
+            # Apply the i-th expert MLP to the i-th task's data slice
+            # input shape: [batch_size, hidden_dim]
+            # output shape: [batch_size, hidden_dim]
+            processed_slice = self.mlps[i](hidden_state_transposed[i])
+            mlp_outputs.append(processed_slice)
+            
+        # Stack the results back into a single tensor along the task dimension.
+        # Shape becomes: [num_tasks, batch_size, hidden_dim]
+        mlp_processed_hidden_state = torch.stack(mlp_outputs, dim=0)
+        
+        # Permute back to the original batch-first layout.
+        # Shape becomes: [batch_size, num_tasks, hidden_dim]
+        mlp_processed_hidden_state = mlp_processed_hidden_state.permute(1, 0, 2)
+
+        # Apply the residual connection
+        hidden_state = residual + mlp_processed_hidden_state
+        
+        # Return the tensor of shape [batch_size, num_tasks, hidden_dim] and attention weights
+        return hidden_state, None
 
 class SigLIPKMoeHead(nn.Module):
     """

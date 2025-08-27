@@ -1,6 +1,6 @@
 """ This files contains the Trainer class for multi-task learning """
 
-import argparse
+import argparse, requests
 import os
 import sys
 from pathlib import Path
@@ -28,12 +28,11 @@ from utils.commons import log_to_disk, get_backbone
 from utils.datasets import get_split, resample, MTLDataset
 from config.task_config import MTLConfig
 from multitask.probe import MultiTaskProbe
-from multitask.dwa import DWALoss
 from gradnorm_pytorch import GradNormLossWeighter
 
 BACKBONE_LR_RATIO = 0.5
 BAL_LOSS_WEIGHT = 0.05
-
+LINEAR_PROBE = 0 # offset for idx
 class Trainer:
     """
     Encapsulates the training, validation, and testing logic for a multi-task probe.
@@ -49,13 +48,13 @@ class Trainer:
         self.device = torch.device(config.device)
         self.scaler = torch.amp.GradScaler('cuda')
         self.version_name = 'Siglip2' if 'google' in args.version else args.version
-        self.saving_interval = 15
+        self.saving_interval = 50
         self.start_epoch = 0
         self.I = 0 # debugging purposes
         self.unfrozen_layers = 0 # besides attention pooling
         self.best_path=None
         self.ckpt_folder = 'ckpt'
-        self.scheduler_type = 'cosine' # or lr_on_platue
+        self.scheduler_type = 'lr_on_platue' # or lr_on_platue
         self.probing_type = (
             'k-probe' if self.args.k_probes
             else 'mhca-moe' if self.args.moe
@@ -68,6 +67,7 @@ class Trainer:
             'backbone': self.args.learning_rate * BACKBONE_LR_RATIO 
         }
         # at epoch key unfreeze the first value layers
+        self.unfreeze_on_schedule = False
         self.unfreeze_schedule = {
             1 : 0, 
             2 : 1, 
@@ -81,7 +81,7 @@ class Trainer:
         self.unfreeze_on_plateau = True  
         self.unfreeze_step = 1           
         self.unfreeze_patience = 1     
-        self.max_unfrozen_layers = 6     
+        self.max_unfrozen_layers = 0     
 
         # State trackers for the dynamic strategy
         self.plateau_counter = 0
@@ -100,6 +100,8 @@ class Trainer:
         self.test_loader = None
         self.optimizer = None
         self.scheduler = None
+        
+        self.i = 0
         self.criterions = {}
         if args.testing:
             self._setup_model_and_optimizer()
@@ -118,7 +120,7 @@ class Trainer:
     def _setup_model_and_optimizer(self):
         """Initializes the model, optimizer, and scheduler."""
         print("[TRAINER] Setting up model and optimizer...")
-        backbone, self.transform, hidden_size = get_backbone(self.args.version, not self.args.testing)
+        backbone, self.transform, hidden_size = get_backbone(self.args.version, apply_migration = not self.args.testing)
 
         task_dims = {task.name.lower(): task.num_classes for task in self.config.tasks}
         
@@ -129,7 +131,8 @@ class Trainer:
             use_moe=self.args.moe,
             use_k_probes=self.args.k_probes,
             uncertainty_weighting_for_bal =  BAL_LOSS_WEIGHT,
-            use_lora = self.config.use_lora 
+            use_lora = self.config.use_lora,
+            deeper_classification_heads = self.args.deeper_classification_heads
         ).to(self.device)
         # self.mtl_probe = torch.compile(self.mtl_probe)
         # grad norm requires that at least one other layer is unfrozen
@@ -148,7 +151,7 @@ class Trainer:
             optimizer_param_groups.append({'params': group['params'], 'lr': lr})
 
         self.optimizer = optim.AdamW(optimizer_param_groups, lr=self.args.learning_rate, fused=True)
-        
+        # self.mtl_probe.load_heads('/user/asessa/tesi/multitask/test_lp/ckpt/mtl_PE-Core-B16-224_ul-1_3.pt')
         if self.use_grad_norm:
             self.loss_weighter = GradNormLossWeighter(
                 num_losses = len(self.config.tasks),
@@ -159,9 +162,9 @@ class Trainer:
 
 
         if self.scheduler_type == 'cosine':
-            self.scheduler = CosineAnnealingWarmRestarts(self.optimizer, T_0=10, T_mult=2)
+            self.scheduler = CosineAnnealingWarmRestarts(self.optimizer, T_0=20, T_mult=2)
         else:
-            self.scheduler = ReduceLROnPlateau(self.optimizer, factor = 0.5) # halve the learning rate on stagnation
+            self.scheduler = ReduceLROnPlateau(self.optimizer, factor = 0.5, patiance = 3) # halve the learning rate on stagnation
 
 
         if self.args.resume_from_ckpt and os.path.exists(self.args.resume_from_ckpt):
@@ -200,7 +203,7 @@ class Trainer:
             print("[Scheduler] Re-initializing CosineAnnealingWarmRestarts scheduler.")
             self.scheduler = CosineAnnealingWarmRestarts(
                 self.optimizer, 
-                T_0=5, 
+                T_0=20, 
                 T_mult=2
             )
             
@@ -214,7 +217,7 @@ class Trainer:
             transform=self.transform,
             augment=True,
             root_dir=self.config.dataset_root,
-            balance=True,
+            balance=True if len(self.config.tasks) > 1 else False,
             csv_has_index=False
         )
         
@@ -292,7 +295,7 @@ class Trainer:
                     self.unfrozen_layers += self.unfreeze_step
                     self.plateau_counter = 0
                     self.best_accuracy_in_stage = -float('inf')
-                    print(f"[Dynamic Unfreezing] Now {self.unfrozen_layers} of the backbone are unfrozen.")
+                    print(f"[DYNAMIC UNFREEZING] Now {self.unfrozen_layers} of the backbone are unfrozen.")
                 else:
                     print("[Plateau Check] Max unfrozen layers reached. No more unfreezing.")
                     self.unfreeze_on_plateau = False 
@@ -310,7 +313,7 @@ class Trainer:
 
         for epoch in range(self.start_epoch, self.args.epochs):
             
-            if epoch in self.unfreeze_schedule and self.unfreeze_on_plateau == False:
+            if epoch in self.unfreeze_schedule and self.unfreeze_on_schedule:
                 print(f'[TRAINER] UNFREEZE OF LAYER {self.unfreeze_schedule[epoch]}')
                 self.unfreeze_layers(self.unfreeze_schedule[epoch])
                 self.unfrozen_layers = self.unfreeze_schedule[epoch]
@@ -321,6 +324,10 @@ class Trainer:
                 self.dwa_current_epoch_loss_sum.zero_()
                 self.dwa_num_batches = 0
 
+            if self.i == 1:
+                val_results = self._run_epoch(self.val_loader, is_training=False, description="Validating")
+                print(f"[LOGGING] VALIDATION Avg Loss: {val_results['avg_loss']:.4f}, Avg Accuracy: {val_results['avg_accuracy']} , Task Accuracies: {val_results['accuracies']}")
+                self.i += 1
 
             train_results = self._run_epoch(self.train_loader, is_training=True, epoch_idx=epoch)
             #   self.mtl_probe.print_requires_grad()  # Debugging: print requires_grad status
@@ -344,7 +351,7 @@ class Trainer:
             print(f"[LOGGING] VALIDATION Avg Loss: {val_results['avg_loss']:.4f}, Avg Accuracy: {val_results['avg_accuracy']} , Task Accuracies: {val_results['accuracies']}")
             
             if isinstance(self.scheduler, ReduceLROnPlateau):
-                self.scheduler.step(val_results['avg_loss'])
+                self.scheduler.step(train_results['avg_loss'])
 
             for task_name, cm in val_results['confusion_matrices'].items():
                 self.save_confusion_matrix(cm, task_name, epoch+1)
@@ -356,7 +363,7 @@ class Trainer:
 
             
             val_accuracy = val_results['avg_accuracy']
-            val_age = val_results['task_losses']['Age']
+            # val_age = val_results['task_losses']['Age']
             self.mtl_probe.log_probe_similarity()
             # dynamic un-freezing logic 
             if self.unfreeze_on_plateau:
@@ -382,7 +389,8 @@ class Trainer:
         if ckpt_path:
             self.mtl_probe.load(ckpt_path)
         else:
-            self.mtl_probe.load(self.best_path)
+            # self.mtl_probe.load(self.best_path)
+            self.mtl_probe.load_heads('/user/asessa/tesi/multitask/test_lp/ckpt/mtl_PE-Core-B16-224_ul-1_3.pt')
 
         print("\n--- Starting Testing ---")
         test_results = self._run_epoch(self.test_loader, is_training=False, description="Testing",save_extreme_wrong=False)
@@ -450,7 +458,6 @@ class Trainer:
                 with torch.autocast(device_type='cuda', dtype=torch.float16, enabled= not self.use_grad_norm):
                     loss, task_losses, task_outputs, bal_loss, shared_features  = self._process_batch(images, labels, self.use_grad_norm)
                 
-                
                 if is_training:
                     self.optimizer.zero_grad()
 
@@ -489,7 +496,7 @@ class Trainer:
                     
                 # Accumulate losses, predictions, and top-k counts
                 for idx, task in enumerate(self.config.tasks):
-                    target = labels[:, idx]
+                    target = labels[:, idx + LINEAR_PROBE]
                     valid_mask = (target != self.config.ignore_index)
                     if not valid_mask.any():
                         continue
@@ -531,7 +538,7 @@ class Trainer:
                                     original_image_tensor = images[valid_mask][idx]
                                     img_path = Path(valid_paths[idx])
                                     save_image(original_image_tensor, output_dir / f"{img_path.stem}.png")
-                     
+                # break    
                 
         # --------------- EPOCH --------------- #
                   
@@ -566,6 +573,7 @@ class Trainer:
         images, labels = images.to(self.device), labels.to(self.device)
         # Forward pass
         model_output = self.mtl_probe(images, return_shared=self.use_grad_norm)
+        
         task_outputs = model_output["logits"]
         bal_loss = model_output.get("balancing_loss")
         shared_features = model_output.get("shared_features", None)
@@ -576,7 +584,7 @@ class Trainer:
 
         for idx, task in enumerate(self.config.tasks):
             criterion = self.criterions[task.name]
-            task_loss = criterion(task_outputs[idx], labels[:, idx])
+            task_loss = criterion(task_outputs[idx], labels[:, idx + LINEAR_PROBE])
             # to avoid to add nan to the batch loss
             if torch.isfinite(task_loss):
                 unweighted_task_losses.append(task_loss)
@@ -653,6 +661,30 @@ class Trainer:
             header=self.config.header
         )
 
+        if train_results:
+            try:
+                task_accuracies_list = [
+                    f"  - `{name}`: {acc:.3f}" 
+                    for name, acc in val_results['accuracies'].items()
+                ]
+                task_accuracies_str = "\n".join(task_accuracies_list)
+
+                message = (
+                    f"**Epoch {epoch_idx + 1} Complete**\n"
+                    f"Experiment: `{self.version_name}`\n\n"
+                    f"🔹 *Training Loss*: `{train_results['avg_loss']:.4f}`\n"
+                    f"🔸 *Validation Loss*: `{val_results['avg_loss']:.4f}`\n\n"
+                    f"✅ *Avg Validation Acc*: `{val_results['avg_accuracy']:.3f}`\n"
+                    f"📋 *Task Accuracies*:\n{task_accuracies_str}\n\n"
+                    f"LR: `{lr:.6f}`"
+                )
+                
+                # Send the message
+                self._send_telegram_message(message)
+                
+            except Exception as e:
+                print(f"\nWarning: Failed to format or send Telegram message. Error: {e}")
+
     def save_confusion_matrix(self, cm: np.ndarray, task_name: str, epoch:int,  is_final: bool = False, accuracy=None, normalized=False):
         """Saves a confusion matrix plot to disk."""
         task = self.config.task_map[task_name]
@@ -676,6 +708,31 @@ class Trainer:
         self.mtl_probe.load_heads(ckpt_paths)
         self.probing_type = self.probing_type + '_pre-trained-heads_'
         print('[TRAINER] Loaded pre-trained heads.')
+
+
+    def _send_telegram_message(self, message: str):
+        """Sends a message to a Telegram chat using credentials from the config."""
+        # Get credentials from your config object. Use getattr for safety.
+        token = "8391904304:AAH5gTZtM82rVhz6N-30jv5sji2-NwdXVkI"
+        chat_id = "1220514183"
+
+        if not token or not chat_id:
+            # Silently fail if credentials are not set
+            return
+
+        api_url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            'chat_id': chat_id,
+            'text': message,
+            'parse_mode': 'Markdown'  # For nice formatting (bold, italics, etc.)
+        }
+
+        try:
+            response = requests.post(api_url, data=payload, timeout=10)
+            response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+        except requests.exceptions.RequestException as e:
+            # Don't crash the training loop if Telegram is down
+            print(f"\nWarning: Could not send Telegram message. Error: {e}")
 
     @staticmethod
     def cleanup():
