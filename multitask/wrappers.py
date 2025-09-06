@@ -8,6 +8,7 @@ and the MoE MLP start with the same weight of the original dense layer)"""
 import torch
 from multitask.moe_task_aware import *
 from transformers.models.siglip2.modular_siglip2 import Siglip2MultiheadAttentionPoolingHead
+import copy
 from dotenv import load_dotenv
 from typing import Optional, Tuple
 import copy
@@ -105,10 +106,19 @@ class SigLIPKProbeHeadExperimental(nn.Module):
         self.attention = original_head.attention
         self.layernorm = original_head.layernorm
         
-
+    
         self.mlps = nn.ModuleList()
+        
         for _ in range(self.num_tasks):
             self.mlps.append(ExpertSiglip())
+
+        original_mlp_weights = original_head.mlp.state_dict()
+        # Iterate directly over each MLP module in the list
+        for mlp in self.mlps:
+            mlp.fc1.weight.data.copy_(original_mlp_weights['fc1.weight'])
+            mlp.fc1.bias.data.copy_(original_mlp_weights['fc1.bias'])
+            mlp.fc2.weight.data.copy_(original_mlp_weights['fc2.weight'])
+            mlp.fc2.bias.data.copy_(original_mlp_weights['fc2.bias'])
 
     def forward(self, hidden_state: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
         batch_size = hidden_state.shape[0]
@@ -265,7 +275,8 @@ class PEMoeViT(nn.Module):
         num_tasks: int,
         num_experts: int,
         top_k: int,
-        task_agnostic_gate: bool
+        task_agnostic_gate: bool,
+        distinct_mlps: bool = True
     ):
         super().__init__()
         print("[WRAPPER] Initializing MoEVisionTransformer Wrapper")
@@ -290,13 +301,16 @@ class PEMoeViT(nn.Module):
         self.proj_dim = original_vit.proj_dim
 
         print("[WRAPPER] Substituing the original AttentionPooling layer to MoEAttentionPooling...")
-        self.attn_pool = MoEAttentionPooling(
-            original_pooler=original_vit.attn_pool,
-            num_tasks=num_tasks,
-            num_experts=num_experts,
-            top_k=top_k,
-            task_agnostic_gate=task_agnostic_gate
-        ).to('cuda')
+        if distinct_mlps:
+            pass
+        else:
+            self.attn_pool = MoEAttentionPooling(
+                original_pooler=original_vit.attn_pool,
+                num_tasks=num_tasks,
+                num_experts=num_experts,
+                top_k=top_k,
+                task_agnostic_gate=task_agnostic_gate
+            ).to('cuda')
 
         # three distinct projection matrices
         proj_tensor_replicated = original_vit.proj.unsqueeze(0).repeat(num_tasks, 1, 1)
@@ -421,3 +435,85 @@ class MoEAttentionPooling(nn.Module):
         final_output = residual + moe_output
 
         return final_output, moe_loss, moe_stats, attn_weights
+
+
+class DistincMLPsPooling(nn.Module):
+    """
+    A wrapper that replaces the MLP in a standard AttentionPooling layer
+    with a k-distinc mlps, on per task. It also implements the k-probes.
+    """
+    def __init__(
+        self,
+        original_pooler: nn.Module,
+        num_tasks: int,
+        seed_probes_from_original=False
+    ):
+        super().__init__()
+        self.attention = original_pooler.attn
+        self.layernorm = original_pooler.layernorm
+        self.num_tasks = num_tasks
+        embed_dim = original_pooler.embed_dim
+
+
+        if seed_probes_from_original:
+            print("[WRAPPER] Seeding new probes from the original probe.")
+            original_probe_data = original_pooler.probe.detach().clone()
+            new_probes_data = original_probe_data.repeat(1, self.num_tasks, 1)
+        else:
+            print("[WRAPPER] Randomly initializing new probes.")
+            new_probes_data = torch.randn(1, self.num_tasks, 768)
+            #if hasattr(original_head.probe, 'data'):
+            #    original_std = original_head.probe.data.std()
+            #    new_probes_data *= original_std
+
+        self.probe = nn.Parameter(new_probes_data)  
+        self.mlps = nn.ModuleList()
+        
+        for _ in range(self.num_tasks):
+            self.mlps.append(ExpertPe(embed_dim, (embed_dim * 4),embed_dim ))
+   
+        original_mlp_weights = original_pooler.mlp.state_dict()
+        for mlp in self.mlps:
+            mlp.fc1.weight.data.copy_(original_mlp_weights['c_fc.weight'])
+            mlp.fc1.bias.data.copy_(original_mlp_weights['c_fc.bias'])
+            mlp.fc2.weight.data.copy_(original_mlp_weights['c_proj.weight'])
+            mlp.fc2.bias.data.copy_(original_mlp_weights['c_proj.bias'])
+
+
+    def forward(self,x: torch.Tensor,return_attn_weights: bool = False):
+
+        batch_size = x.shape[0]
+        # Repeat the probes for each item in the batch
+        # probe shape -> (batch_size, num_tasks, embed_dim)
+        probe = self.probe.repeat(batch_size, 1, 1)
+        
+        # attn_output shape -> (batch_size, num_tasks, embed_dim)
+        attn_output, attn_weights = self.attention(probe, x, x, need_weights=return_attn_weights)
+        
+        # First residual connection
+        residual = attn_output
+        
+        # Apply layer normalization
+        layernorm_output = self.layernorm(attn_output)
+        
+
+        mlp_outputs = []
+        for i in range(self.num_tasks):
+            # task_data shape -> (batch_size, embed_dim)
+            task_data = layernorm_output[:, i, :]
+            
+            mlp_output = self.mlps[i](task_data)
+            
+            # mlp_output.unsqueeze(1) shape -> (batch_size, 1, embed_dim)
+            mlp_outputs.append(mlp_output.unsqueeze(1))
+
+        # final_mlp_output shape -> (batch_size, num_tasks, embed_dim)
+        final_mlp_output = torch.cat(mlp_outputs, dim=1)
+        
+        final_output = residual + final_mlp_output
+
+
+        if return_attn_weights:
+            return final_output, attn_weights
+        
+        return final_output

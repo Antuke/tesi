@@ -23,9 +23,8 @@ from peft import  get_peft_model, LoraConfig, TaskType, PeftModel
 
 from core.vision_encoder import pe 
 from utils.commons import *
-from multitask.wrappers import SigLIPKMoeHead, SigLIPKProbeHead, PEMoeViT, SigLIPKProbeHeadExperimental
+from multitask.wrappers import SigLIPKMoeHead, SigLIPKProbeHead, PEMoeViT, SigLIPKProbeHeadExperimental, DistincMLPsPooling
 
-DROPOUT_P = 0.5
 DEVICE = 'cuda' 
 
 class EfficientProbingHead(nn.Module):
@@ -159,6 +158,7 @@ class BackboneStrategy(nn.Module, ABC):
         self.num_tasks = num_tasks
         self.task_agnostic_gate = task_agnostic_gate
         self.use_lora = use_lora
+        self.enabled_k_probes=False
 
     def setup_layers(self, num_layers_to_unfreeze: int):
         for param in self.parameters():
@@ -208,8 +208,8 @@ class BackboneStrategy(nn.Module, ABC):
 
         # print(f'[LORA] target modules = {lora_target_modules}')
         self.lora_config =  LoraConfig(
-            r=16,                
-            lora_alpha=32,      
+            r=32,             
+            lora_alpha=64,      
             target_modules=lora_target_modules, 
             lora_dropout=0.1,
             init_lora_weights='eva',
@@ -457,9 +457,11 @@ class PEStrategy(BackboneStrategy):
         self.backbone = PEMoeViT(self.backbone, num_tasks=num_tasks, num_experts=num_experts, top_k=top_k, task_agnostic_gate=self.task_agnostic_gate)
     
     def enable_k_probes(self, task_proj = False):
-        original_probe = self.backbone.attn_pool.probe.data
-        new_probes = original_probe.repeat(1, self.num_tasks, 1)
-        self.backbone.attn_pool.probe = nn.Parameter(new_probes)
+        #original_probe = self.backbone.attn_pool.probe.data
+        #new_probes = original_probe.repeat(1, self.num_tasks, 1)
+        #self.backbone.attn_pool.probe = nn.Parameter(new_probes)
+        self.backbone.attn_pool = DistincMLPsPooling(self.backbone.attn_pool, self.num_tasks)
+
 
         if task_proj:
             if self.backbone.proj is not None:
@@ -503,6 +505,7 @@ class SigLIPStrategy(BackboneStrategy):
         #new_probes = original_probe.repeat(1, self.num_tasks, 1)
         #self.backbone.head.probe = nn.Parameter(new_probes)
         self.backbone.head = SigLIPKProbeHeadExperimental(self.backbone.head, self.num_tasks)
+        self.enabled_k_probes=True
         
     def get_probe(self) -> nn.Parameter:
         return self.backbone.head.probe.data
@@ -510,8 +513,9 @@ class SigLIPStrategy(BackboneStrategy):
     def forward(self, x: torch.Tensor, last_hidden_state: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Dict]]:
         if last_hidden_state:
             return self.backbone(pixel_values=x).last_hidden_state
-
-        output, attn_weights = self.backbone(pixel_values=x).pooler_output
+        if self.enabled_k_probes:
+            output, attn_weights = self.backbone(pixel_values=x).pooler_output
+        output = self.backbone(pixel_values=x).pooler_output
         if len(output) == 4: # MoE case
             shared_features, balancing_loss, stats, attn_weights = output
             return shared_features, balancing_loss, stats, attn_weights
@@ -534,23 +538,27 @@ class SigLIPStrategy(BackboneStrategy):
         if self.currently_unfrozen_layers == -1:
 
             if self.use_lora:
-                lora_params = []
-                for name, param in self.backbone.named_parameters():
-                    if 'lora_' in name:
-                        if 'attn_pool' not in name:
+                print("[SETUP] Using LoRa!")
+                self.currently_unfrozen_layers = 99
+                if self.use_lora:
+                    lora_params = []
+                    for name, param in self.backbone.named_parameters():
+                        if 'lora_' in name:
                             print(f"[LORA] Adding LoRa matrices: {name}")
+                            print(param.requires_grad)
+                            param.requires_grad = True
                             lora_params.append(param)
 
-                    if 'head' in name or 'base_model.model.head.proj' == name:
-                        lora_params.append(param)
+                        if 'probe' in name or 'gating' in name or name == 'base_model.model.head.proj':
+                            print(f"[LORA] Adding {name}")
+                            param.requires_grad = True
+                            lora_params.append(param)
 
-                if lora_params:
-                    new_param_groups.append({'name': 'lora', 'params': lora_params})
-                    print(f"Identified 'lora' parameter group with {len(lora_params)} tensors.")
-                    print_trainable_parameters(self.backbone)
-                
-                self.currently_unfrozen_layers = 99
-                return new_param_groups
+                    if lora_params:
+                        new_param_groups.append({'name': 'lora', 'params': lora_params})
+                        print(f"Identified 'lora' parameter group with {len(lora_params)} tensors.")
+                        print_trainable_parameters(self.backbone)
+                    return new_param_groups
 
             print("Unfreezing the SigLip head parameters...")
             head_params_to_unfreeze = []

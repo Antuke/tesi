@@ -31,7 +31,7 @@ def _get_backbone_pe(ckpt, version):
     backbone.load_ckpt(ckpt)
     return backbone, transform, backbone_config.output_dim
 
-def get_backbone_pe(version, print_info=False, apply_migration=False):
+def get_backbone_pe(version, print_info=False, apply_migration_flag=False):
     """
     Load PE ViT model, return model, transforms and size of output (dimension of embedding of last token)
     """
@@ -39,7 +39,10 @@ def get_backbone_pe(version, print_info=False, apply_migration=False):
     backbone = pe.VisionTransformer.from_config(version, pretrained=True)
     backbone_config = PE_VISION_CONFIG[version]
     transform = transforms_pe.get_image_transform_fix(image_size=backbone_config.image_size)
-
+    print("==============================")
+    print(transform)
+    print(f"applying migration = {apply_migration_flag}")
+    print("==============================")
     if print_info:
         attnpool= backbone.attn_pool
         print(f'embed_dim={attnpool.embed_dim}\nnum_heads={attnpool.num_heads}')
@@ -48,8 +51,9 @@ def get_backbone_pe(version, print_info=False, apply_migration=False):
     def apply_migration(m):
         if isinstance(m, pe.SelfAttention):
             m.migrate_weights()
-    if apply_migration: # when testing/resuming no migration should be used
-        print('[MIGRATION] Migratin weights for PEFT compatibilty')
+
+    if apply_migration_flag == True: # when testing/resuming no migration should be used
+        print('[MIGRATION] Migrating weights for PEFT compatibiltyy')
         backbone.apply(apply_migration)
 
     return backbone, transform, backbone_config.output_dim
@@ -123,7 +127,7 @@ def _convert_to_rgb(image: Image.Image) -> Image.Image:
     return image.convert("RGB")
 
 
-def get_backbone(version: str, apply_migration : bool = False, ):
+def get_backbone(version: str, apply_migration : bool = False):
     """
     Returns vision transformer backbone
     Args:
@@ -132,7 +136,8 @@ def get_backbone(version: str, apply_migration : bool = False, ):
     """
     if 'PE-Core-' in version:
         return get_backbone_pe(version, False, apply_migration)
-    elif 'Siglip2' in version:
+    elif 'siglip2' in version:
+        print('[LOADING SIGLIP2]')
         return get_backbone_siglip2(version)
     elif 'dinov3' in version:
         return get_backbone_dinov3(version)

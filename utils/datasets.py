@@ -448,7 +448,7 @@ class MTLDataset(Dataset):
         self.emotion_column = 5 if csv_has_index else 4
 
 
-    def _balance_dataset(self, column_name, target_percentage=0.33):
+    def _balance_dataset(self, column_name, target_percentage=0.4):
         """Duplicates samples with valid labels in the specified column to meet the target percentage."""
         print(f"[DATASET] Balancing dataset on column: '{column_name}' to reach at least {target_percentage*100:.1f}% valid samples.")
             
@@ -487,39 +487,42 @@ class MTLDataset(Dataset):
         new_valid = len(self.labels_df[self.labels_df[column_name] != MISSING_LABEL ])
         print(f"[DATASET] Balancing complete. New total samples: {new_total}. New valid samples: {new_valid} ({(new_valid/new_total)*100:.1f}%).")
 
-    def get_inverse_weights_loss(self):
+    def get_inverse_weights_loss(self, age_weights=True, gender_weights=False, emotion_weights=True):
 
         weights = {}
         # --- Age weights ---
-        valid_age_labels = self.labels_df[self.labels_df.iloc[:, self.age_column] != MISSING_LABEL]
-        total_valid_age = len(valid_age_labels)
-        if total_valid_age > 0:
-            class_counts_age = valid_age_labels.iloc[:, self.age_column].value_counts()
-            weights_age = torch.zeros(len(age_id2label))
-            for class_idx, count in class_counts_age.items():
-                weights_age[int(class_idx)] = total_valid_age / (len(age_id2label) * count)
-            weights['Age'] = weights_age
+        if age_weights:
+            valid_age_labels = self.labels_df[self.labels_df.iloc[:, self.age_column] != MISSING_LABEL]
+            total_valid_age = len(valid_age_labels)
+            if total_valid_age > 0:
+                class_counts_age = valid_age_labels.iloc[:, self.age_column].value_counts()
+                weights_age = torch.zeros(len(age_id2label))
+                for class_idx, count in class_counts_age.items():
+                    weights_age[int(class_idx)] = total_valid_age / (len(age_id2label) * count)
+                weights['Age'] = weights_age
 
         # --- Gender weights ---
-        valid_gender_labels = self.labels_df[self.labels_df.iloc[:, self.gender_column] != MISSING_LABEL]
-        total_valid_gender = len(valid_gender_labels)
-        if total_valid_gender > 0:
-            class_counts_gender = valid_gender_labels.iloc[:, self.gender_column].value_counts()
-            weights_gender = torch.zeros(len(gender_id2label))
-            for class_idx, count in class_counts_gender.items():
-                weights_gender[int(class_idx)] = total_valid_gender / (len(gender_id2label) * count)
-            weights['Gender'] = weights_gender
+        if gender_weights:
+            valid_gender_labels = self.labels_df[self.labels_df.iloc[:, self.gender_column] != MISSING_LABEL]
+            total_valid_gender = len(valid_gender_labels)
+            if total_valid_gender > 0:
+                class_counts_gender = valid_gender_labels.iloc[:, self.gender_column].value_counts()
+                weights_gender = torch.zeros(len(gender_id2label))
+                for class_idx, count in class_counts_gender.items():
+                    weights_gender[int(class_idx)] = total_valid_gender / (len(gender_id2label) * count)
+                weights['Gender'] = weights_gender
 
         # --- Emotion weights ---
-        valid_emotion_labels = self.labels_df[self.labels_df.iloc[:, self.emotion_column] != MISSING_LABEL]
-        total_valid_emotion = len(valid_emotion_labels)
-        if total_valid_emotion > 0:
-            class_counts_emotion = valid_emotion_labels.iloc[:, self.emotion_column].value_counts()
-            weights_emotion = torch.zeros(len(emotion_id2label))
-            for class_idx, count in class_counts_emotion.items():
-                weights_emotion[int(class_idx)] = total_valid_emotion / (len(emotion_id2label) * count)
-            weights['Emotion'] = weights_emotion
-        
+        if emotion_weights:
+            valid_emotion_labels = self.labels_df[self.labels_df.iloc[:, self.emotion_column] != MISSING_LABEL]
+            total_valid_emotion = len(valid_emotion_labels)
+            if total_valid_emotion > 0:
+                class_counts_emotion = valid_emotion_labels.iloc[:, self.emotion_column].value_counts()
+                weights_emotion = torch.zeros(len(emotion_id2label))
+                for class_idx, count in class_counts_emotion.items():
+                    weights_emotion[int(class_idx)] = total_valid_emotion / (len(emotion_id2label) * count)
+                weights['Emotion'] = weights_emotion
+            
         return weights
 
 

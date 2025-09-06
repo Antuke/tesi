@@ -18,6 +18,24 @@ from tqdm import tqdm
 import numpy as np
 from torchvision.utils import save_image
 from torch.cuda.amp import autocast
+
+import torch
+import numpy as np
+import random
+import os
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed) # Numpy module.
+    random.seed(seed) # Python random module.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+set_seed(42)
+
 # Environment and Path Setup
 load_dotenv()
 REPO_PATH = os.getenv("REPO_PATH")
@@ -28,11 +46,11 @@ from utils.commons import log_to_disk, get_backbone
 from utils.datasets import get_split, resample, MTLDataset
 from config.task_config import MTLConfig
 from multitask.probe import MultiTaskProbe
+from multitask.ordinalLoss import OrdinalRegressionLoss
 from gradnorm_pytorch import GradNormLossWeighter
 
-BACKBONE_LR_RATIO = 0.5
+BACKBONE_LR_RATIO = 0.1
 BAL_LOSS_WEIGHT = 0.05
-LINEAR_PROBE = 0 # offset for idx
 class Trainer:
     """
     Encapsulates the training, validation, and testing logic for a multi-task probe.
@@ -42,7 +60,7 @@ class Trainer:
     - Running the training and evaluation loops.
     - Logging results and saving checkpoints.
     """
-    def __init__(self, config: MTLConfig, args: argparse.Namespace):
+    def __init__(self, config: MTLConfig, args: argparse.Namespace, offset=0):
         self.config = config
         self.args = args
         self.device = torch.device(config.device)
@@ -50,11 +68,13 @@ class Trainer:
         self.version_name = 'Siglip2' if 'google' in args.version else args.version
         self.saving_interval = 50
         self.start_epoch = 0
+        self.using_ordinal_loss=False
         self.I = 0 # debugging purposes
         self.unfrozen_layers = 0 # besides attention pooling
         self.best_path=None
         self.ckpt_folder = 'ckpt'
-        self.scheduler_type = 'lr_on_platue' # or lr_on_platue
+        self.scheduler_type = 'cosine' # or lr_on_platue/cosine
+        self.offset = offset
         self.probing_type = (
             'k-probe' if self.args.k_probes
             else 'mhca-moe' if self.args.moe
@@ -69,16 +89,13 @@ class Trainer:
         # at epoch key unfreeze the first value layers
         self.unfreeze_on_schedule = False
         self.unfreeze_schedule = {
-            1 : 0, 
-            2 : 1, 
-            3 : 2,
-            4 : 3
+            5 : 0, 
         }
 
         self.use_uncertainty_weighting = config.use_uncertainty_weighting
 
         # dynamic unfreezing
-        self.unfreeze_on_plateau = True  
+        self.unfreeze_on_plateau = False  
         self.unfreeze_step = 1           
         self.unfreeze_patience = 1     
         self.max_unfrozen_layers = 0     
@@ -116,14 +133,17 @@ class Trainer:
         class_weights = self._setup_loaders()
         self._setup_criterions(class_weights)
 
+        
+
 
     def _setup_model_and_optimizer(self):
         """Initializes the model, optimizer, and scheduler."""
         print("[TRAINER] Setting up model and optimizer...")
-        backbone, self.transform, hidden_size = get_backbone(self.args.version, apply_migration = not self.args.testing)
+        backbone, self.transform, hidden_size = get_backbone(self.args.version, apply_migration = True)
 
         task_dims = {task.name.lower(): task.num_classes for task in self.config.tasks}
-        
+
+
         self.mtl_probe = MultiTaskProbe(
             backbone=backbone,
             backbone_output_dim=hidden_size,
@@ -164,7 +184,7 @@ class Trainer:
         if self.scheduler_type == 'cosine':
             self.scheduler = CosineAnnealingWarmRestarts(self.optimizer, T_0=20, T_mult=2)
         else:
-            self.scheduler = ReduceLROnPlateau(self.optimizer, factor = 0.5, patiance = 3) # halve the learning rate on stagnation
+            self.scheduler = ReduceLROnPlateau(self.optimizer, factor = 0.5, patience = 3) # halve the learning rate on stagnation
 
 
         if self.args.resume_from_ckpt and os.path.exists(self.args.resume_from_ckpt):
@@ -217,7 +237,7 @@ class Trainer:
             transform=self.transform,
             augment=True,
             root_dir=self.config.dataset_root,
-            balance=True if len(self.config.tasks) > 1 else False,
+            balance=True if len(self.config.tasks) > 2 else False,
             csv_has_index=False
         )
         
@@ -229,12 +249,12 @@ class Trainer:
             balance=False
         )
 
-        self.train_loader = DataLoader(dataset_train, batch_size=self.args.batch_size, num_workers=self.config.num_workers, pin_memory=True, shuffle=True)
+        self.train_loader = DataLoader(dataset_train, batch_size=self.args.batch_size, num_workers=self.config.num_workers, pin_memory=False, shuffle=True)
         if self.config.num_workers <= 2:
             print(f'[WARNING] THE NUMBER OF WORKERS IS ONLY {self.config.num_workers} THIS MAY RESULT IN A SLOW TRAINING')
-        self.val_loader = DataLoader(dataset_val, batch_size=self.args.batch_size, num_workers=self.config.num_workers, pin_memory=True, shuffle=False)
+        self.val_loader = DataLoader(dataset_val, batch_size=self.args.batch_size, num_workers=self.config.num_workers, pin_memory=False, shuffle=False)
         
-        return dataset_train.get_inverse_weights_loss()
+        return dataset_train.get_inverse_weights_loss(age_weights= 'Age' in [task.name for task in self.config.tasks], emotion_weights= 'Emotion' in [task.name for task in self.config.tasks])
 
 
     def _setup_test_loader(self, save_extreme_wrong=False):
@@ -255,9 +275,13 @@ class Trainer:
         """Initializes loss functions with optional class weighting."""
         print("[TRAINER] Setting up criterions...")
         for task in self.config.tasks:
-            params = {'ignore_index': self.config.ignore_index}
+            params = {'ignore_index': -100}
             if task.use_weighted_loss and task.name in class_weights:
                 params['weight'] = class_weights[task.name].to(self.device)
+                if isinstance(task.criterion, OrdinalRegressionLoss):
+                    print('[TRAINER] USING ORDINAL REGRESSION LOSS')
+                    params['num_classes'] = task.num_classes - 1
+                    self.using_ordinal_loss=True
                 print(f"[TRAINER] Using weighted loss for task: {task.name}")
             self.criterions[task.name] = task.criterion(**params)
 
@@ -351,7 +375,7 @@ class Trainer:
             print(f"[LOGGING] VALIDATION Avg Loss: {val_results['avg_loss']:.4f}, Avg Accuracy: {val_results['avg_accuracy']} , Task Accuracies: {val_results['accuracies']}")
             
             if isinstance(self.scheduler, ReduceLROnPlateau):
-                self.scheduler.step(train_results['avg_loss'])
+                self.scheduler.step(val_results['avg_loss'])
 
             for task_name, cm in val_results['confusion_matrices'].items():
                 self.save_confusion_matrix(cm, task_name, epoch+1)
@@ -382,9 +406,9 @@ class Trainer:
                 save_path = self.config.output_folder / 'ckpt' / f"mtl_{self.version_name}_ul{self.unfrozen_layers}_{epoch + 1}.pt"
                 self.mtl_probe.save(path=str(save_path), epoch=epoch + 1, optimizer=self.optimizer, scheduler=self.scheduler)
 
-    def test(self, ckpt_path=None):
+    def test(self, ckpt_path=None, sew= False):
         """Evaluates the model on the test set. Saves confusion matrices and generates a test_result.txt"""
-        self._setup_test_loader(save_extreme_wrong=False)
+        self._setup_test_loader(save_extreme_wrong=sew)
 
         if ckpt_path:
             self.mtl_probe.load(ckpt_path)
@@ -393,7 +417,7 @@ class Trainer:
             self.mtl_probe.load_heads('/user/asessa/tesi/multitask/test_lp/ckpt/mtl_PE-Core-B16-224_ul-1_3.pt')
 
         print("\n--- Starting Testing ---")
-        test_results = self._run_epoch(self.test_loader, is_training=False, description="Testing",save_extreme_wrong=False)
+        test_results = self._run_epoch(self.test_loader, is_training=False, description="Testing",save_extreme_wrong=sew)
         
         for task_name, cm in test_results['confusion_matrices'].items():
             self.save_confusion_matrix(cm, task_name, 0, is_final=True, accuracy=test_results['avg_accuracy'])
@@ -496,7 +520,7 @@ class Trainer:
                     
                 # Accumulate losses, predictions, and top-k counts
                 for idx, task in enumerate(self.config.tasks):
-                    target = labels[:, idx + LINEAR_PROBE]
+                    target = labels[:, idx + self.offset]
                     valid_mask = (target != self.config.ignore_index)
                     if not valid_mask.any():
                         continue
@@ -510,20 +534,37 @@ class Trainer:
                         valid_targets = target[valid_mask].to(self.device)
 
 
-                        preds = valid_outputs.argmax(dim=1)
-                        all_preds[task.name].extend(preds.cpu().numpy())
-                        all_true[task.name].extend(valid_targets.cpu().numpy())
+                        if task.name.lower() == 'age' and self.using_ordinal_loss:
+                            # --- ORDINAL TASK EVALUATION ---
+                            
+                            # 1. Get predictions using the correct ordinal function
+                            preds = ordinal_logits_to_prediction(valid_outputs)
+                            
+                            # Append predictions and true labels for later analysis
+                            all_preds[task.name].extend(preds.cpu().numpy())
+                            all_true[task.name].extend(valid_targets.cpu().numpy())
 
 
-                        valid_targets_gpu = valid_targets.to(valid_outputs.device)
+                            correct_top_k_counts[task.name] += torch.sum(torch.abs(preds - valid_targets)).item() # MAE when ordinal loss i
+                            
+  
                         
-                        _, top_k_preds = torch.topk(valid_outputs, k, dim=1)
-                        expanded_labels = valid_targets_gpu.view(-1, 1).expand_as(top_k_preds)
-                        
-                        correct_in_batch = torch.sum(torch.any(top_k_preds == expanded_labels, dim=1)).item()
-                        correct_top_k_counts[task.name] += correct_in_batch
+                        else:
+                            # --- STANDARD CLASSIFICATION TASK EVALUATION (Your original logic) ---
+                            
+                            # Use argmax for standard tasks
+                            preds = valid_outputs.argmax(dim=1)
+                            all_preds[task.name].extend(preds.cpu().numpy())
+                            all_true[task.name].extend(valid_targets.cpu().numpy())
 
-                        if save_extreme_wrong and (task.name == 'age' or task.name == 'Age'):
+                            # Use top-k for standard tasks
+                            valid_targets_gpu = valid_targets.to(valid_outputs.device)
+                            _, top_k_preds = torch.topk(valid_outputs, k, dim=1)
+                            expanded_labels = valid_targets_gpu.view(-1, 1).expand_as(top_k_preds)
+                            correct_in_batch = torch.sum(torch.any(top_k_preds == expanded_labels, dim=1)).item()
+                            correct_top_k_counts[task.name] += correct_in_batch
+
+                        if save_extreme_wrong:
                             misclassified = preds != valid_targets
 
                             valid_paths = [p for i, p in enumerate(paths) if valid_mask[i]]
@@ -532,13 +573,14 @@ class Trainer:
                                 true_label = valid_targets[idx].item()
                                 pred_label = preds[idx].item()
 
-                                if abs(true_label - pred_label) > 3:
+                                if abs(true_label - pred_label) > 0:
                                     output_dir = self.config.output_folder / f"extreme_wrong_classifications/true_{true_label}/pred_{pred_label}"
                                     output_dir.mkdir(parents=True, exist_ok=True)
                                     original_image_tensor = images[valid_mask][idx]
                                     img_path = Path(valid_paths[idx])
+                                    print(f"Mis-classified PATH = {img_path} ; true = {true_label} ; predicted = {pred_label}")
                                     save_image(original_image_tensor, output_dir / f"{img_path.stem}.png")
-                # break    
+                # break     
                 
         # --------------- EPOCH --------------- #
                   
@@ -584,7 +626,8 @@ class Trainer:
 
         for idx, task in enumerate(self.config.tasks):
             criterion = self.criterions[task.name]
-            task_loss = criterion(task_outputs[idx], labels[:, idx + LINEAR_PROBE])
+            task_loss = criterion(task_outputs[idx], labels[:, idx + self.offset])
+
             # to avoid to add nan to the batch loss
             if torch.isfinite(task_loss):
                 unweighted_task_losses.append(task_loss)
@@ -599,7 +642,9 @@ class Trainer:
             batch_losses_tensor = torch.stack(unweighted_task_losses)
             self.dwa_current_epoch_loss_sum += batch_losses_tensor.detach()
             self.dwa_num_batches += 1
-            total_loss = torch.sum(batch_losses_tensor * self.dwa_task_weights)      
+            total_loss = torch.sum(batch_losses_tensor * self.dwa_task_weights)   
+        elif self.config.use_grad_norm:
+            total_loss += task_loss  
         else:  # Default static weight
             for idx, task_loss in enumerate(unweighted_task_losses):
                 total_loss += task_loss * self.config.tasks[idx].weight
@@ -616,7 +661,7 @@ class Trainer:
     def _log_epoch_results(self, epoch_idx: int, train_results: Dict, val_results: Dict):
         """Logs the results of an epoch to a CSV file."""
         lr = self.scheduler.get_last_lr()[0] if self.scheduler else self.args.learning_rate
-        loss_weights_str = ""
+        loss_weights_str = "1,1,1"
 
         if self.use_grad_norm:
             weights_values = self.mtl_probe.loss_weights.detach().cpu().tolist()
@@ -757,3 +802,12 @@ class Trainer:
 
 
 
+def ordinal_logits_to_prediction(logits: torch.Tensor) -> torch.Tensor:
+    """
+    Converts ordinal logits from the model into a final class prediction.
+    """
+    # Convert logits to probabilities P(y > k) using the sigmoid function
+    probs = torch.sigmoid(logits)
+    # The final predicted class is the count of probabilities > 0.5
+    predicted_labels = torch.sum(probs > 0.5, dim=1)
+    return predicted_labels
