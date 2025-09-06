@@ -123,7 +123,7 @@ class MultiTaskProbe(nn.Module):
             })
         else:
             self.heads = nn.ModuleDict({
-                task_name: _get_classifier_head(768, out_dim, DROPOUT_P)
+                task_name: _get_classifier_head(backbone_output_dim, out_dim, DROPOUT_P)
                 for task_name, out_dim in self.tasks.items()
             })
         self.use_lora = use_lora
@@ -212,7 +212,16 @@ class MultiTaskProbe(nn.Module):
 
         # --- Create a single group for all head-related parameters ---
         head_params = list(self.heads.parameters())
-
+        """ 
+        total_head_params = 0
+        print(f"--- Classification Heads Parameters ({len(list(self.heads.named_parameters()))}) ---")
+        for name, param in self.heads.named_parameters():
+            if param.requires_grad:
+                num_params = param.numel() # Get the total number of elements
+                total_head_params += num_params
+                print(f"- Name: {name:<40} | Parameters: {num_params:<10} | Shape: {param.shape}")
+        print(f"Total trainable parameters in heads: {total_head_params}")
+        """
         if using_grad_norm:
             pass 
             
@@ -227,9 +236,9 @@ class MultiTaskProbe(nn.Module):
 
     def load_heads(self, ckpt_paths: Dict[str, str], device: str = 'cuda'):
         """Loads weights from checkpoints into the respective heads."""
-        checkpoint = torch.load(ckpt_paths, map_location=device, weights_only=False)
-        self.heads.load_state_dict(checkpoint['head_state_dict'], strict=True)
-        return
+        #checkpoint = torch.load(ckpt_paths, map_location=device, weights_only=False)
+        #self.heads.load_state_dict(checkpoint['head_state_dict'], strict=True)
+        #return
         for task_name, head in self.heads.items():
              if ckpt_path := ckpt_paths.get(task_name):
                 try:
